@@ -1,4 +1,4 @@
- """
+"""
 OSINT Telegram Bot v2
 Стек: Python 3.10+, aiogram 3, SQLite
 """
