@@ -7,14 +7,18 @@ import asyncio
 import logging
 import sqlite3
 import re
-from datetime import datetime
+import os
+import io
+import tempfile
+from datetime import datetime, timedelta
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command
 from aiogram.types import (
     Message, CallbackQuery,
     InlineKeyboardMarkup, InlineKeyboardButton,
-    LabeledPrice, PreCheckoutQuery
+    LabeledPrice, PreCheckoutQuery,
+    BufferedInputFile
 )
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.context import FSMContext
@@ -177,15 +181,16 @@ def get_requests_left(user_id: int) -> int:
 
 # ─── FSM ─────────────────────────────────────────────────────────────────────
 class S(StatesGroup):
-    username = State()
-    phone    = State()
-    email    = State()
-    image    = State()
-    vk       = State()
-    car      = State()
-    ip       = State()
-    inn      = State()
-    telegram = State()
+    username    = State()
+    phone       = State()
+    email       = State()
+    image       = State()
+    vk          = State()
+    car         = State()
+    ip          = State()
+    inn         = State()
+    telegram    = State()
+    full_search = State()
 
 # ─── Клавиатуры ──────────────────────────────────────────────────────────────
 def kb_main(user_id: int, rl: int) -> InlineKeyboardMarkup:
@@ -211,6 +216,7 @@ def kb_main(user_id: int, rl: int) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="🏢 ИНН / ОГРН",       callback_data="s_inn"),
         ],
         [InlineKeyboardButton(text="🖼 Reverse Image Search", callback_data="s_image")],
+        [InlineKeyboardButton(text="🗂 Полное досье (всё сразу)", callback_data="s_full")],
         [InlineKeyboardButton(text=f"💎 Купить запросы  |  💰 Баланс: {bal}", callback_data="buy_menu")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -501,6 +507,247 @@ async def fn_image(url: str) -> str:
         f"• [Bing Visual](https://www.bing.com/images/search?q=imgurl:{url}&view=detailv2) — Microsoft\n\n"
         f"💡 Для лучшего результата загрузи фото напрямую на Яндекс Картинки!"
     )
+
+# ─── Фото из профилей ────────────────────────────────────────────────────────
+async def _fetch_og_image(client: httpx.AsyncClient, url: str) -> bytes | None:
+    """Пробует получить og:image с профильной страницы."""
+    try:
+        r = await client.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
+        if r.status_code != 200:
+            return None
+        # og:image в обоих порядках атрибутов
+        og = re.search(
+            r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\'](https?://[^"\']+)["\']', r.text
+        ) or re.search(
+            r'<meta[^>]+content=["\'](https?://[^"\']+)["\'][^>]+property=["\']og:image["\']', r.text
+        )
+        if og:
+            img_r = await client.get(og.group(1), timeout=8)
+            ct = img_r.headers.get("content-type", "")
+            if img_r.status_code == 200 and "image" in ct:
+                return img_r.content
+    except Exception:
+        pass
+    return None
+
+async def fetch_profile_photos(username: str) -> list[tuple[str, bytes]]:
+    """
+    Пытается скачать аватарки с популярных платформ.
+    Возвращает список (платформа, bytes).
+    """
+    targets = [
+        ("GitHub",    f"https://github.com/{username}"),
+        ("Telegram",  f"https://t.me/{username}"),
+        ("ВКонтакте", f"https://vk.com/{username}"),
+        ("TikTok",    f"https://www.tiktok.com/@{username}"),
+        ("Instagram", f"https://www.instagram.com/{username}/"),
+        ("Twitter/X", f"https://twitter.com/{username}"),
+    ]
+    results: list[tuple[str, bytes]] = []
+    async with httpx.AsyncClient(follow_redirects=True) as client:
+        for name, url in targets:
+            data = await _fetch_og_image(client, url)
+            if data:
+                results.append((name, data))
+            if len(results) >= 5:
+                break
+    return results
+
+# ─── PDF генерация ────────────────────────────────────────────────────────────
+FONT_PATH = "/tmp/DejaVuSans.ttf"
+FONT_BOLD_PATH = "/tmp/DejaVuSans-Bold.ttf"
+FONT_URL      = "https://github.com/dejavu-fonts/dejavu-fonts/raw/master/ttf/DejaVuSans.ttf"
+FONT_BOLD_URL = "https://github.com/dejavu-fonts/dejavu-fonts/raw/master/ttf/DejaVuSans-Bold.ttf"
+
+async def ensure_fonts():
+    """Скачивает шрифт с поддержкой кириллицы, если ещё не скачан."""
+    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+        for path, url in [(FONT_PATH, FONT_URL), (FONT_BOLD_PATH, FONT_BOLD_URL)]:
+            if not os.path.exists(path):
+                r = await client.get(url)
+                with open(path, "wb") as f:
+                    f.write(r.content)
+
+def _clean(text: str) -> str:
+    """Убирает Markdown-символы для вставки в PDF."""
+    return re.sub(r'[*_`\[\]()]', '', text).strip()
+
+def generate_osint_pdf(
+    query: str,
+    input_type: str,
+    sections: list[dict],   # [{"title": str, "source": str, "lines": [str]}]
+    photos: list[tuple[str, bytes]],
+    expires_at: datetime,
+) -> bytes:
+    """
+    Генерирует PDF-досье и возвращает байты.
+    Требует, чтобы шрифты уже были скачаны (ensure_fonts).
+    """
+    from fpdf import FPDF
+
+    TYPE_LABELS = {"phone": "📱 Телефон", "email": "📧 Email", "username": "🔍 Ник / Username"}
+
+    class PDF(FPDF):
+        def header(self):
+            self.set_font("DejaVu", size=8)
+            self.set_text_color(150, 150, 150)
+            self.cell(0, 6, "OSINT Bot — Автоматизированный отчёт | Только для законного использования", align="C")
+            self.ln(2)
+            self.set_draw_color(200, 200, 200)
+            self.line(10, self.get_y(), 200, self.get_y())
+            self.ln(3)
+
+        def footer(self):
+            self.set_y(-15)
+            self.set_font("DejaVu", size=8)
+            self.set_text_color(150, 150, 150)
+            exp_str = expires_at.strftime("%d.%m.%Y %H:%M")
+            self.cell(0, 10, f"Стр. {self.page_no()} | Действителен до: {exp_str} | Сгенерирован: {datetime.now().strftime('%d.%m.%Y %H:%M')}", align="C")
+
+    pdf = PDF()
+    pdf.add_font("DejaVu",      fname=FONT_PATH)
+    pdf.add_font("DejaVu", style="B", fname=FONT_BOLD_PATH)
+    pdf.set_auto_page_break(auto=True, margin=20)
+    pdf.set_margins(15, 15, 15)
+
+    # ── Титульная страница ────────────────────────────────────────────────────
+    pdf.add_page()
+    pdf.set_fill_color(20, 20, 40)
+    pdf.rect(0, 0, 210, 297, "F")
+
+    pdf.set_y(60)
+    pdf.set_font("DejaVu", style="B", size=28)
+    pdf.set_text_color(255, 215, 0)
+    pdf.cell(0, 15, "OSINT ДОСЬЕ", align="C", ln=True)
+
+    pdf.set_font("DejaVu", size=13)
+    pdf.set_text_color(200, 200, 200)
+    pdf.cell(0, 10, "Разведка по открытым источникам", align="C", ln=True)
+
+    pdf.ln(10)
+    pdf.set_draw_color(255, 215, 0)
+    pdf.line(40, pdf.get_y(), 170, pdf.get_y())
+    pdf.ln(10)
+
+    pdf.set_font("DejaVu", style="B", size=14)
+    pdf.set_text_color(255, 255, 255)
+    pdf.cell(0, 10, f"Запрос: {_clean(query)}", align="C", ln=True)
+
+    pdf.set_font("DejaVu", size=11)
+    pdf.set_text_color(180, 180, 180)
+    pdf.cell(0, 8, f"Тип данных: {TYPE_LABELS.get(input_type, input_type)}", align="C", ln=True)
+    pdf.cell(0, 8, f"Дата: {datetime.now().strftime('%d.%m.%Y %H:%M')}", align="C", ln=True)
+
+    pdf.ln(8)
+    pdf.set_font("DejaVu", style="B", size=10)
+    pdf.set_text_color(255, 100, 100)
+    exp_str = expires_at.strftime("%d.%m.%Y %H:%M")
+    pdf.cell(0, 8, f"⚠  Действителен до: {exp_str}", align="C", ln=True)
+
+    pdf.ln(15)
+    pdf.set_font("DejaVu", size=9)
+    pdf.set_text_color(100, 100, 100)
+    pdf.multi_cell(
+        0, 6,
+        "Данный отчёт создан автоматически на основе открытых источников.\n"
+        "Использование в незаконных целях запрещено.",
+        align="C"
+    )
+
+    # ── Фотографии ───────────────────────────────────────────────────────────
+    if photos:
+        pdf.add_page()
+        pdf.set_fill_color(255, 255, 255)
+        pdf.rect(0, 0, 210, 297, "F")
+
+        pdf.set_font("DejaVu", style="B", size=16)
+        pdf.set_text_color(20, 20, 40)
+        pdf.cell(0, 12, "Найденные фотографии профилей", ln=True)
+        pdf.set_draw_color(255, 215, 0)
+        pdf.line(15, pdf.get_y(), 195, pdf.get_y())
+        pdf.ln(5)
+
+        x_positions = [15, 110]
+        y_start = pdf.get_y()
+        col = 0
+
+        for platform, img_bytes in photos:
+            try:
+                img_io = io.BytesIO(img_bytes)
+                # Определяем формат
+                header = img_bytes[:4]
+                ext = "JPEG"
+                if header[:4] == b'\x89PNG':
+                    ext = "PNG"
+                elif header[:4] == b'GIF8':
+                    ext = "GIF"
+
+                with tempfile.NamedTemporaryFile(suffix=f".{ext.lower()}", delete=False) as tmp:
+                    tmp.write(img_bytes)
+                    tmp_path = tmp.name
+
+                x = x_positions[col]
+                y = y_start if col < 2 else y_start + 95
+
+                pdf.image(tmp_path, x=x, y=y, w=80, h=80)
+                pdf.set_xy(x, y + 81)
+                pdf.set_font("DejaVu", style="B", size=9)
+                pdf.set_text_color(20, 20, 40)
+                pdf.cell(80, 6, platform, align="C")
+
+                os.unlink(tmp_path)
+                col += 1
+                if col >= 2:
+                    col = 0
+                    y_start += 95
+            except Exception:
+                pass
+
+    # ── Разделы с данными ────────────────────────────────────────────────────
+    for section in sections:
+        pdf.add_page()
+        pdf.set_fill_color(255, 255, 255)
+        pdf.rect(0, 0, 210, 297, "F")
+
+        # Заголовок раздела
+        pdf.set_fill_color(20, 20, 40)
+        pdf.rect(15, 15, 180, 14, "F")
+        pdf.set_xy(15, 15)
+        pdf.set_font("DejaVu", style="B", size=13)
+        pdf.set_text_color(255, 215, 0)
+        pdf.cell(180, 14, _clean(section.get("title", "")), align="C")
+        pdf.ln(5)
+
+        # Источник
+        pdf.set_font("DejaVu", size=8)
+        pdf.set_text_color(120, 120, 120)
+        pdf.cell(0, 6, f"Источник: {_clean(section.get('source', 'Открытые источники'))}", ln=True)
+        pdf.set_draw_color(230, 230, 230)
+        pdf.line(15, pdf.get_y(), 195, pdf.get_y())
+        pdf.ln(4)
+
+        # Содержимое
+        pdf.set_font("DejaVu", size=10)
+        pdf.set_text_color(30, 30, 30)
+        for line in section.get("lines", []):
+            clean_line = _clean(line)
+            if not clean_line:
+                pdf.ln(2)
+                continue
+            if clean_line.startswith("==="):
+                # Подзаголовок
+                pdf.set_font("DejaVu", style="B", size=11)
+                pdf.set_text_color(20, 20, 100)
+                pdf.cell(0, 8, clean_line.replace("===", "").strip(), ln=True)
+                pdf.set_font("DejaVu", size=10)
+                pdf.set_text_color(30, 30, 30)
+            elif clean_line.startswith("•"):
+                pdf.set_x(20)
+                pdf.multi_cell(0, 6, clean_line, align="L")
+            else:
+                pdf.multi_cell(0, 6, clean_line, align="L")
+
+    return bytes(pdf.output())
 
 # ─── Главный хендлер ─────────────────────────────────────────────────────────
 dp = Dispatcher(storage=MemoryStorage())
@@ -822,6 +1069,269 @@ async def cmd_give(msg: Message):
         await msg.bot.send_message(target_id, f"🎁 Тебе добавлено {count} запросов! Баланс: {user['requests_left']}")
     except:
         pass
+
+# ─── Полное досье ────────────────────────────────────────────────────────────
+def detect_input_type(query: str) -> str:
+    """Определяет тип входных данных: phone / email / username"""
+    q = query.strip()
+    if re.match(r'^[\+\d][\d\s\-\(\)]{6,}$', q):
+        return "phone"
+    if re.match(r'^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$', q):
+        return "email"
+    return "username"
+
+async def fn_full_search(query: str) -> tuple[list[str], list[dict], str]:
+    """
+    Запускает все релевантные поиски по одному идентификатору.
+    Возвращает (telegram_parts, pdf_sections, input_type).
+    """
+    q = query.strip()
+    input_type = detect_input_type(q)
+
+    tg_parts: list[str] = []
+    pdf_sections: list[dict] = []
+
+    header = (
+        f"🗂 *ПОЛНОЕ ДОСЬЕ*\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"🔎 Запрос: `{q}`\n"
+        f"📌 Тип: *{'📱 Телефон' if input_type == 'phone' else '📧 Email' if input_type == 'email' else '🔍 Username/Ник'}*\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+    )
+    tg_parts.append(header)
+
+    if input_type == "phone":
+        clean = re.sub(r'[^\d+]', '', q)
+        num_digits = re.sub(r'[^\d]', '', clean)
+
+        phone_text = await fn_phone(q)
+        tg_parts.append(phone_text)
+        pdf_sections.append({
+            "title": "📱 Анализ телефонного номера",
+            "source": "Локальная база операторов РФ + открытые сервисы",
+            "lines": phone_text.split("\n"),
+        })
+
+        tg_text = (
+            f"💬 *Telegram по номеру:*\n"
+            f"• [Открыть в Telegram](https://t.me/+{num_digits})\n"
+            f"• [TGStat поиск](https://tgstat.ru/search?q={num_digits})\n"
+        )
+        tg_parts.append(tg_text)
+        pdf_sections.append({
+            "title": "💬 Telegram по номеру",
+            "source": "t.me / tgstat.ru",
+            "lines": [
+                f"Ссылка для открытия: https://t.me/+{num_digits}",
+                f"Поиск TGStat: https://tgstat.ru/search?q={num_digits}",
+            ],
+        })
+
+        vk_text = await fn_vk(num_digits)
+        tg_parts.append(f"*ВКонтакте по номеру:*\n" + vk_text)
+        pdf_sections.append({
+            "title": "👤 ВКонтакте — поиск по номеру",
+            "source": "vk.com",
+            "lines": vk_text.split("\n"),
+        })
+
+    elif input_type == "email":
+        nick = q.split('@')[0]
+
+        email_text = await fn_email(q)
+        tg_parts.append(email_text)
+        pdf_sections.append({
+            "title": "📧 Анализ Email",
+            "source": "HaveIBeenPwned / DeHashed / BreachDirectory",
+            "lines": email_text.split("\n"),
+        })
+
+        tg_parts.append(f"🔍 *Поиск по нику из email (`{nick}`):*")
+        username_text = await fn_username(nick)
+        tg_parts.append(username_text)
+        pdf_sections.append({
+            "title": f"🔍 Поиск ника из email: {nick}",
+            "source": "20 социальных платформ (Sherlock-подход)",
+            "lines": username_text.split("\n"),
+        })
+
+        vk_text = await fn_vk(nick)
+        tg_parts.append(vk_text)
+        pdf_sections.append({
+            "title": "👤 ВКонтакте по нику",
+            "source": "vk.com",
+            "lines": vk_text.split("\n"),
+        })
+
+        tg_text = await fn_telegram(nick)
+        tg_parts.append(tg_text)
+        pdf_sections.append({
+            "title": "💬 Telegram по нику",
+            "source": "t.me",
+            "lines": tg_text.split("\n"),
+        })
+
+    else:
+        nick = q.lstrip('@')
+
+        username_text = await fn_username(nick)
+        tg_parts.append(username_text)
+        pdf_sections.append({
+            "title": "🔍 Поиск по нику — 20 платформ",
+            "source": "ВКонтакте, Instagram, Twitter, TikTok, GitHub, YouTube, Telegram, Reddit и др.",
+            "lines": username_text.split("\n"),
+        })
+
+        vk_text = await fn_vk(nick)
+        tg_parts.append(vk_text)
+        pdf_sections.append({
+            "title": "👤 ВКонтакте",
+            "source": "vk.com",
+            "lines": vk_text.split("\n"),
+        })
+
+        tg_text = await fn_telegram(nick)
+        tg_parts.append(tg_text)
+        pdf_sections.append({
+            "title": "💬 Telegram",
+            "source": "t.me",
+            "lines": tg_text.split("\n"),
+        })
+
+    tg_parts.append(
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"✅ *Досье сформировано*\n"
+        f"📄 Генерирую PDF-отчёт... ⏳"
+    )
+    return tg_parts, pdf_sections, input_type
+
+
+async def _delete_pdf_later(bot: Bot, chat_id: int, message_id: int):
+    """Удаляет PDF через 24 часа."""
+    await asyncio.sleep(86400)
+    try:
+        await bot.delete_message(chat_id, message_id)
+        await bot.send_message(
+            chat_id,
+            "🗑 *PDF-досье удалено*\n"
+            "_Срок действия 24 часа истёк. Повторите запрос при необходимости._",
+            parse_mode="Markdown"
+        )
+    except Exception:
+        pass
+
+
+@dp.callback_query(F.data == "s_full")
+async def cb_full(cb: CallbackQuery, state: FSMContext):
+    await check_access(cb, state, S.full_search,
+        "🗂 *Полное досье — всё сразу*\n\n"
+        "Введи один из:\n"
+        "📱 *Телефон:* `+79161234567`\n"
+        "📧 *Email:* `example@mail.ru`\n"
+        "🔍 *Ник:* `durov`\n\n"
+        "Бот сам определит тип и соберёт всё возможное, "
+        "включая фото профилей и PDF-отчёт 🕵️")
+
+@dp.message(S.full_search)
+async def h_full(msg: Message, state: FSMContext, bot: Bot):
+    await state.clear()
+    q = msg.text.strip()
+    use_request(msg.from_user.id)
+    log_search(msg.from_user.id, "full_search", q)
+
+    w = await msg.answer(
+        "🗂 Собираю полное досье...\n\n"
+        "⏳ Шаг 1/3: поиск по источникам",
+        parse_mode="Markdown"
+    )
+
+    try:
+        tg_parts, pdf_sections, input_type = await fn_full_search(q)
+
+        # Шаг 1 — отправляем текстовые части
+        await w.edit_text("⏳ Шаг 2/3: ищу фотографии профилей...", parse_mode="Markdown")
+
+        # Определяем ник для поиска фото
+        if input_type == "phone":
+            nick_for_photos = None
+        elif input_type == "email":
+            nick_for_photos = q.split('@')[0]
+        else:
+            nick_for_photos = q.strip().lstrip('@')
+
+        # Шаг 2 — ищем фото
+        photos: list[tuple[str, bytes]] = []
+        if nick_for_photos:
+            photos = await fetch_profile_photos(nick_for_photos)
+
+        # Шаг 3 — генерируем PDF
+        await w.edit_text("⏳ Шаг 3/3: генерирую PDF-отчёт...", parse_mode="Markdown")
+        await ensure_fonts()
+
+        expires_at = datetime.now() + timedelta(hours=24)
+        pdf_bytes = generate_osint_pdf(
+            query=q,
+            input_type=input_type,
+            sections=pdf_sections,
+            photos=photos,
+            expires_at=expires_at,
+        )
+
+        await w.delete()
+
+        # Отправляем текстовые части
+        for part in tg_parts:
+            if part and part.strip():
+                try:
+                    await msg.answer(part, parse_mode="Markdown", disable_web_page_preview=True)
+                except Exception:
+                    chunks = [part[i:i+3500] for i in range(0, len(part), 3500)]
+                    for chunk in chunks:
+                        await msg.answer(chunk, parse_mode="Markdown", disable_web_page_preview=True)
+
+        # Отправляем фото (если нашли)
+        if photos:
+            await msg.answer(f"📸 *Найдено фотографий профилей: {len(photos)}*", parse_mode="Markdown")
+            for platform_name, img_bytes in photos:
+                try:
+                    await msg.answer_photo(
+                        BufferedInputFile(img_bytes, filename=f"{platform_name}.jpg"),
+                        caption=f"📸 {platform_name}"
+                    )
+                except Exception:
+                    pass
+
+        # Отправляем PDF
+        filename = f"osint_{q[:20].replace(' ', '_')}_{datetime.now().strftime('%Y%m%d')}.pdf"
+        pdf_msg = await msg.answer_document(
+            BufferedInputFile(pdf_bytes, filename=filename),
+            caption=(
+                f"📄 *PDF-досье*\n"
+                f"🔎 Запрос: `{q}`\n"
+                f"⚠️ Действителен до: *{expires_at.strftime('%d.%m.%Y %H:%M')}*\n"
+                f"_Файл будет автоматически удалён через 24 часа_"
+            ),
+            parse_mode="Markdown"
+        )
+
+        # Планируем удаление через 24 часа
+        asyncio.create_task(_delete_pdf_later(bot, msg.chat.id, pdf_msg.message_id))
+
+    except Exception as e:
+        try:
+            await w.delete()
+        except Exception:
+            pass
+        await msg.answer(f"⚠️ Ошибка при сборе досье: {e}")
+        log.exception("h_full error")
+
+    rl = get_requests_left(msg.from_user.id)
+    bal = "∞" if is_admin(msg.from_user.id) else str(rl)
+    await msg.answer(
+        f"💰 Баланс: *{bal} запросов*",
+        parse_mode="Markdown",
+        reply_markup=kb_main(msg.from_user.id, rl)
+    )
 
 # ─── Запуск ──────────────────────────────────────────────────────────────────
 async def main():
