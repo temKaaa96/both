@@ -597,177 +597,178 @@ def _clean(text: str) -> str:
 def generate_osint_pdf(
     query: str,
     input_type: str,
-    sections: list[dict],   # [{"title": str, "source": str, "lines": [str]}]
+    sections: list[dict],
     photos: list[tuple[str, bytes]],
     expires_at: datetime,
 ) -> bytes:
     """
     Генерирует PDF-досье и возвращает байты.
-    Требует, чтобы шрифты уже были скачаны (ensure_fonts).
+    Простой надёжный макет без сложного позиционирования.
     """
     from fpdf import FPDF
 
     TYPE_LABELS = {"phone": "Телефон", "email": "Email", "username": "Ник / Username"}
+    exp_str    = expires_at.strftime("%d.%m.%Y %H:%M")
+    now_str    = datetime.now().strftime("%d.%m.%Y %H:%M")
+    W          = 180   # ширина контентной зоны (A4=210 - 2*15 отступов)
 
     class PDF(FPDF):
         def header(self):
+            self.set_left_margin(15)
+            self.set_right_margin(15)
             self.set_font("DejaVu", size=8)
-            self.set_text_color(150, 150, 150)
-            self.cell(0, 6, "OSINT Bot — Автоматизированный отчёт | Только для законного использования", align="C")
-            self.ln(2)
-            self.set_draw_color(200, 200, 200)
-            self.line(10, self.get_y(), 200, self.get_y())
+            self.set_text_color(140, 140, 140)
+            self.cell(W, 6, "OSINT Bot — автоматизированный отчёт. Только для законного использования.", align="C", new_x="LMARGIN", new_y="NEXT")
+            self.set_draw_color(180, 180, 180)
+            self.line(15, self.get_y(), 195, self.get_y())
             self.ln(3)
 
         def footer(self):
-            self.set_y(-15)
+            self.set_y(-14)
+            self.set_left_margin(15)
+            self.set_right_margin(15)
             self.set_font("DejaVu", size=8)
-            self.set_text_color(150, 150, 150)
-            exp_str = expires_at.strftime("%d.%m.%Y %H:%M")
-            self.cell(0, 10, f"Стр. {self.page_no()} | Действителен до: {exp_str} | Сгенерирован: {datetime.now().strftime('%d.%m.%Y %H:%M')}", align="C")
+            self.set_text_color(140, 140, 140)
+            self.cell(W, 8, f"стр. {self.page_no()}   |   Действителен до: {exp_str}   |   Создан: {now_str}", align="C")
 
     pdf = PDF()
-    pdf.add_font("DejaVu",      fname=FONT_PATH)
+    pdf.add_font("DejaVu",          fname=FONT_PATH)
     pdf.add_font("DejaVu", style="B", fname=FONT_BOLD_PATH)
-    pdf.set_auto_page_break(auto=True, margin=20)
-    pdf.set_margins(15, 15, 15)
+    pdf.set_left_margin(15)
+    pdf.set_right_margin(15)
+    pdf.set_top_margin(15)
+    pdf.set_auto_page_break(auto=True, margin=18)
 
-    # ── Титульная страница ────────────────────────────────────────────────────
+    # ── Титул ────────────────────────────────────────────────────────────────
     pdf.add_page()
-    pdf.set_fill_color(20, 20, 40)
-    pdf.rect(0, 0, 210, 297, "F")
 
-    pdf.set_y(60)
-    pdf.set_font("DejaVu", style="B", size=28)
-    pdf.set_text_color(255, 215, 0)
-    pdf.cell(0, 15, "OSINT ДОСЬЕ", align="C", ln=True)
+    pdf.set_font("DejaVu", style="B", size=24)
+    pdf.set_text_color(15, 15, 50)
+    pdf.cell(W, 14, "OSINT ДОСЬЕ", align="C", new_x="LMARGIN", new_y="NEXT")
 
-    pdf.set_font("DejaVu", size=13)
-    pdf.set_text_color(200, 200, 200)
-    pdf.cell(0, 10, "Разведка по открытым источникам", align="C", ln=True)
+    pdf.set_draw_color(15, 15, 50)
+    pdf.set_line_width(0.8)
+    pdf.line(15, pdf.get_y(), 195, pdf.get_y())
+    pdf.set_line_width(0.2)
+    pdf.ln(5)
 
-    pdf.ln(10)
-    pdf.set_draw_color(255, 215, 0)
-    pdf.line(40, pdf.get_y(), 170, pdf.get_y())
-    pdf.ln(10)
+    pdf.set_font("DejaVu", size=12)
+    pdf.set_text_color(60, 60, 60)
+    pdf.cell(W, 8, "Разведка по открытым источникам", align="C", new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(6)
 
-    pdf.set_font("DejaVu", style="B", size=14)
-    pdf.set_text_color(255, 255, 255)
-    pdf.cell(0, 10, f"Запрос: {_clean(query)}", align="C", ln=True)
-
+    info_lines = [
+        f"Запрос:      {_clean(query)}",
+        f"Тип данных:  {TYPE_LABELS.get(input_type, input_type)}",
+        f"Создан:      {now_str}",
+        f"Действителен до: {exp_str}",
+    ]
     pdf.set_font("DejaVu", size=11)
-    pdf.set_text_color(180, 180, 180)
-    pdf.cell(0, 8, f"Тип данных: {TYPE_LABELS.get(input_type, input_type)}", align="C", ln=True)
-    pdf.cell(0, 8, f"Дата: {datetime.now().strftime('%d.%m.%Y %H:%M')}", align="C", ln=True)
+    pdf.set_text_color(30, 30, 30)
+    for line in info_lines:
+        pdf.cell(W, 7, line, new_x="LMARGIN", new_y="NEXT")
+
+    pdf.ln(6)
+    pdf.set_font("DejaVu", size=9)
+    pdf.set_text_color(160, 0, 0)
+    pdf.cell(W, 6, "ВНИМАНИЕ: файл действителен 24 часа и будет удалён автоматически.", align="C", new_x="LMARGIN", new_y="NEXT")
 
     pdf.ln(8)
-    pdf.set_font("DejaVu", style="B", size=10)
-    pdf.set_text_color(255, 100, 100)
-    exp_str = expires_at.strftime("%d.%m.%Y %H:%M")
-    pdf.cell(0, 8, f"!  Действителен до: {exp_str}", align="C", ln=True)
-
-    pdf.ln(15)
-    pdf.set_font("DejaVu", size=9)
-    pdf.set_text_color(100, 100, 100)
-    pdf.multi_cell(
-        0, 6,
-        "Данный отчёт создан автоматически на основе открытых источников.\n"
-        "Использование в незаконных целях запрещено.",
+    pdf.set_draw_color(200, 200, 200)
+    pdf.line(15, pdf.get_y(), 195, pdf.get_y())
+    pdf.ln(4)
+    pdf.set_font("DejaVu", size=8)
+    pdf.set_text_color(140, 140, 140)
+    pdf.multi_cell(W, 5,
+        "Данный отчёт создан автоматически на основе открытых источников данных. "
+        "Использование в незаконных целях запрещено. "
+        "Точность данных не гарантируется — проверяйте информацию в первоисточниках.",
         align="C"
     )
 
     # ── Фотографии ───────────────────────────────────────────────────────────
     if photos:
         pdf.add_page()
-        pdf.set_fill_color(255, 255, 255)
-        pdf.rect(0, 0, 210, 297, "F")
-
-        pdf.set_font("DejaVu", style="B", size=16)
-        pdf.set_text_color(20, 20, 40)
-        pdf.cell(0, 12, "Найденные фотографии профилей", ln=True)
-        pdf.set_draw_color(255, 215, 0)
+        pdf.set_font("DejaVu", style="B", size=14)
+        pdf.set_text_color(15, 15, 50)
+        pdf.cell(W, 10, "Найденные фотографии профилей", new_x="LMARGIN", new_y="NEXT")
+        pdf.set_draw_color(15, 15, 50)
+        pdf.set_line_width(0.5)
         pdf.line(15, pdf.get_y(), 195, pdf.get_y())
+        pdf.set_line_width(0.2)
         pdf.ln(5)
 
-        x_positions = [15, 110]
-        y_start = pdf.get_y()
-        col = 0
+        col, row = 0, 0
+        img_w, img_h, gap = 80, 75, 8
+        x_base = [15, 110]
 
-        for platform, img_bytes in photos:
+        for platform_name, img_bytes in photos:
             try:
-                img_io = io.BytesIO(img_bytes)
-                # Определяем формат
-                header = img_bytes[:4]
-                ext = "JPEG"
-                if header[:4] == b'\x89PNG':
-                    ext = "PNG"
-                elif header[:4] == b'GIF8':
-                    ext = "GIF"
-
+                header4 = img_bytes[:4]
+                ext = "PNG" if header4[:3] == b'\x89PN' else "JPEG"
                 with tempfile.NamedTemporaryFile(suffix=f".{ext.lower()}", delete=False) as tmp:
                     tmp.write(img_bytes)
                     tmp_path = tmp.name
 
-                x = x_positions[col]
-                y = y_start if col < 2 else y_start + 95
+                x = x_base[col]
+                y = 50 + row * (img_h + gap + 8)
 
-                pdf.image(tmp_path, x=x, y=y, w=80, h=80)
-                pdf.set_xy(x, y + 81)
+                pdf.image(tmp_path, x=x, y=y, w=img_w, h=img_h)
+                pdf.set_xy(x, y + img_h + 1)
                 pdf.set_font("DejaVu", style="B", size=9)
-                pdf.set_text_color(20, 20, 40)
-                pdf.cell(80, 6, platform, align="C")
+                pdf.set_text_color(15, 15, 50)
+                pdf.cell(img_w, 6, _clean(platform_name), align="C")
 
                 os.unlink(tmp_path)
                 col += 1
                 if col >= 2:
                     col = 0
-                    y_start += 95
+                    row += 1
             except Exception:
                 pass
 
     # ── Разделы с данными ────────────────────────────────────────────────────
     for section in sections:
         pdf.add_page()
-        pdf.set_fill_color(255, 255, 255)
-        pdf.rect(0, 0, 210, 297, "F")
+        pdf.set_left_margin(15)
+        pdf.set_right_margin(15)
 
-        # Заголовок раздела
-        pdf.set_fill_color(20, 20, 40)
-        pdf.rect(15, 15, 180, 14, "F")
-        pdf.set_xy(15, 15)
+        # Заголовок
         pdf.set_font("DejaVu", style="B", size=13)
-        pdf.set_text_color(255, 215, 0)
-        pdf.cell(180, 14, _clean(section.get("title", "")), align="C")
-        pdf.ln(5)
+        pdf.set_text_color(15, 15, 50)
+        title = _clean(section.get("title", ""))
+        pdf.cell(W, 10, title, new_x="LMARGIN", new_y="NEXT")
+        pdf.set_draw_color(15, 15, 50)
+        pdf.set_line_width(0.5)
+        pdf.line(15, pdf.get_y(), 195, pdf.get_y())
+        pdf.set_line_width(0.2)
+        pdf.ln(2)
 
         # Источник
         pdf.set_font("DejaVu", size=8)
         pdf.set_text_color(120, 120, 120)
-        pdf.cell(0, 6, f"Источник: {_clean(section.get('source', 'Открытые источники'))}", ln=True)
-        pdf.set_draw_color(230, 230, 230)
+        source = _clean(section.get("source", "Открытые источники"))
+        pdf.cell(W, 5, f"Источник: {source}", new_x="LMARGIN", new_y="NEXT")
+        pdf.set_draw_color(210, 210, 210)
         pdf.line(15, pdf.get_y(), 195, pdf.get_y())
         pdf.ln(4)
 
-        # Содержимое
+        # Строки содержимого
         pdf.set_font("DejaVu", size=10)
         pdf.set_text_color(30, 30, 30)
-        for line in section.get("lines", []):
-            clean_line = _clean(line)
-            if not clean_line:
-                pdf.ln(2)
+        for raw_line in section.get("lines", []):
+            line = _clean(raw_line)
+            if not line:
+                pdf.ln(1)
                 continue
-            if clean_line.startswith("==="):
-                # Подзаголовок
-                pdf.set_font("DejaVu", style="B", size=11)
-                pdf.set_text_color(20, 20, 100)
-                pdf.cell(0, 8, clean_line.replace("===", "").strip(), ln=True)
-                pdf.set_font("DejaVu", size=10)
-                pdf.set_text_color(30, 30, 30)
-            elif clean_line.startswith("•"):
-                pdf.set_x(20)
-                pdf.multi_cell(0, 6, clean_line, align="L")
-            else:
-                pdf.multi_cell(0, 6, clean_line, align="L")
+            # Длинные URL — пропускаем
+            if line.startswith("http") and len(line) > 100:
+                continue
+            try:
+                pdf.set_x(15)
+                pdf.multi_cell(W, 5.5, line, align="L")
+            except Exception:
+                pass
 
     return bytes(pdf.output())
 
