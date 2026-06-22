@@ -573,8 +573,26 @@ async def ensure_fonts():
                 log.info(f"Шрифт сохранён: {path} ({len(r.content)} байт)")
 
 def _clean(text: str) -> str:
-    """Убирает Markdown-символы для вставки в PDF."""
-    return re.sub(r'[*_`\[\]()]', '', text).strip()
+    """Убирает Markdown-символы и эмодзи для вставки в PDF (DejaVu не поддерживает emoji)."""
+    # Markdown
+    text = re.sub(r'[*_`]', '', text)
+    text = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', text)  # [text](url) → text
+    # Эмодзи и спецсимволы вне Latin/Cyrillic
+    text = re.sub(
+        r'[\U0001F000-\U0001FFFF'   # всякие эмодзи
+        r'\U00002600-\U000027BF'    # разные символы (☀✂ и др.)
+        r'\U0001F900-\U0001F9FF'    # дополнительные эмодзи
+        r'\U00002702-\U000027B0'
+        r'\U000024C2-\U0001F251'
+        r'\U0001FA00-\U0001FA6F'
+        r'\U0001FA70-\U0001FAFF'
+        r'\u200d\ufe0f\u20e3'       # zero-width joiner, variation selector
+        r']+',
+        '', text, flags=re.UNICODE
+    )
+    # Убираем лишние пробелы
+    text = re.sub(r'  +', ' ', text)
+    return text.strip()
 
 def generate_osint_pdf(
     query: str,
@@ -589,7 +607,7 @@ def generate_osint_pdf(
     """
     from fpdf import FPDF
 
-    TYPE_LABELS = {"phone": "📱 Телефон", "email": "📧 Email", "username": "🔍 Ник / Username"}
+    TYPE_LABELS = {"phone": "Телефон", "email": "Email", "username": "Ник / Username"}
 
     class PDF(FPDF):
         def header(self):
@@ -646,7 +664,7 @@ def generate_osint_pdf(
     pdf.set_font("DejaVu", style="B", size=10)
     pdf.set_text_color(255, 100, 100)
     exp_str = expires_at.strftime("%d.%m.%Y %H:%M")
-    pdf.cell(0, 8, f"⚠  Действителен до: {exp_str}", align="C", ln=True)
+    pdf.cell(0, 8, f"!  Действителен до: {exp_str}", align="C", ln=True)
 
     pdf.ln(15)
     pdf.set_font("DejaVu", size=9)
@@ -1111,7 +1129,7 @@ async def fn_full_search(query: str) -> tuple[list[str], list[dict], str]:
         phone_text = await fn_phone(q)
         tg_parts.append(phone_text)
         pdf_sections.append({
-            "title": "📱 Анализ телефонного номера",
+            "title": "Анализ телефонного номера",
             "source": "Локальная база операторов РФ + открытые сервисы",
             "lines": phone_text.split("\n"),
         })
@@ -1123,7 +1141,7 @@ async def fn_full_search(query: str) -> tuple[list[str], list[dict], str]:
         )
         tg_parts.append(tg_text)
         pdf_sections.append({
-            "title": "💬 Telegram по номеру",
+            "title": "Telegram по номеру",
             "source": "t.me / tgstat.ru",
             "lines": [
                 f"Ссылка для открытия: https://t.me/+{num_digits}",
@@ -1134,7 +1152,7 @@ async def fn_full_search(query: str) -> tuple[list[str], list[dict], str]:
         vk_text = await fn_vk(num_digits)
         tg_parts.append(f"*ВКонтакте по номеру:*\n" + vk_text)
         pdf_sections.append({
-            "title": "👤 ВКонтакте — поиск по номеру",
+            "title": "ВКонтакте — поиск по номеру",
             "source": "vk.com",
             "lines": vk_text.split("\n"),
         })
@@ -1145,7 +1163,7 @@ async def fn_full_search(query: str) -> tuple[list[str], list[dict], str]:
         email_text = await fn_email(q)
         tg_parts.append(email_text)
         pdf_sections.append({
-            "title": "📧 Анализ Email",
+            "title": "Анализ Email",
             "source": "HaveIBeenPwned / DeHashed / BreachDirectory",
             "lines": email_text.split("\n"),
         })
@@ -1154,7 +1172,7 @@ async def fn_full_search(query: str) -> tuple[list[str], list[dict], str]:
         username_text = await fn_username(nick)
         tg_parts.append(username_text)
         pdf_sections.append({
-            "title": f"🔍 Поиск ника из email: {nick}",
+            "title": f"Поиск ника из email: {nick}",
             "source": "20 социальных платформ (Sherlock-подход)",
             "lines": username_text.split("\n"),
         })
@@ -1162,7 +1180,7 @@ async def fn_full_search(query: str) -> tuple[list[str], list[dict], str]:
         vk_text = await fn_vk(nick)
         tg_parts.append(vk_text)
         pdf_sections.append({
-            "title": "👤 ВКонтакте по нику",
+            "title": "ВКонтакте по нику",
             "source": "vk.com",
             "lines": vk_text.split("\n"),
         })
@@ -1170,7 +1188,7 @@ async def fn_full_search(query: str) -> tuple[list[str], list[dict], str]:
         tg_text = await fn_telegram(nick)
         tg_parts.append(tg_text)
         pdf_sections.append({
-            "title": "💬 Telegram по нику",
+            "title": "Telegram по нику",
             "source": "t.me",
             "lines": tg_text.split("\n"),
         })
@@ -1181,7 +1199,7 @@ async def fn_full_search(query: str) -> tuple[list[str], list[dict], str]:
         username_text = await fn_username(nick)
         tg_parts.append(username_text)
         pdf_sections.append({
-            "title": "🔍 Поиск по нику — 20 платформ",
+            "title": "Поиск по нику — 20 платформ",
             "source": "ВКонтакте, Instagram, Twitter, TikTok, GitHub, YouTube, Telegram, Reddit и др.",
             "lines": username_text.split("\n"),
         })
@@ -1189,7 +1207,7 @@ async def fn_full_search(query: str) -> tuple[list[str], list[dict], str]:
         vk_text = await fn_vk(nick)
         tg_parts.append(vk_text)
         pdf_sections.append({
-            "title": "👤 ВКонтакте",
+            "title": "ВКонтакте",
             "source": "vk.com",
             "lines": vk_text.split("\n"),
         })
@@ -1197,7 +1215,7 @@ async def fn_full_search(query: str) -> tuple[list[str], list[dict], str]:
         tg_text = await fn_telegram(nick)
         tg_parts.append(tg_text)
         pdf_sections.append({
-            "title": "💬 Telegram",
+            "title": "Telegram",
             "source": "t.me",
             "lines": tg_text.split("\n"),
         })
