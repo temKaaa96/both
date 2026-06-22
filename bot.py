@@ -1315,7 +1315,11 @@ async def h_full(msg: Message, state: FSMContext, bot: Bot):
         # Шаг 2 — ищем фото
         photos: list[tuple[str, bytes]] = []
         if nick_for_photos:
-            photos = await fetch_profile_photos(nick_for_photos)
+            try:
+                photos = await fetch_profile_photos(nick_for_photos)  # если функция позже появится
+            except Exception as e:
+                log.error(f"Ошибка при получении фото: {e}")
+                photos = []
 
         # Шаг 3 — генерируем PDF
         await w.edit_text("⏳ Шаг 3/3: генерирую PDF-отчёт...", parse_mode="Markdown")
