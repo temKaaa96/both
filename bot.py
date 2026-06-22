@@ -508,121 +508,91 @@ async def fn_image(url: str) -> str:
         f"💡 Для лучшего результата загрузи фото напрямую на Яндекс Картинки!"
     )
 
-# ─── Генерация красивого PDF ─────────────────────────────────────────────────
+# ─── Фото из профилей ────────────────────────────────────────────────────────
+async def _fetch_og_image(client: httpx.AsyncClient, url: str) -> bytes | None:
+    """Пробует получить og:image с профильной страницы."""
+    try:
+        r = await client.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
+        if r.status_code != 200:
+            return None
+        # og:image в обоих порядках атрибутов
+        og = re.search(
+            r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\'](https?://[^"\']+)["\']', r.text
+        ) or re.search(
+            r'<meta[^>]+content=["\'](https?://[^"\']+)["\'][^>]+property=["\']og:image["\']', r.text
+        )
+        if og:
+            img_r = await client.get(og.group(1), timeout=8)
+            ct = img_r.headers.get("content-type", "")
+            if img_r.status_code == 200 and "image" in ct:
+                return img_r.content
+    except Exception:
+        pass
+    return None
 
-from fpdf import FPDF
-import tempfile
-import os
-from datetime import datetime
+async def fetch_profile_photos(username: str) -> list[tuple[str, bytes]]:
+    """
+    Пытается скачать аватарки с популярных платформ.
+    Возвращает список (платформа, bytes).
+    """
+    targets = [
+        ("GitHub",    f"https://github.com/{username}"),
+        ("Telegram",  f"https://t.me/{username}"),
+        ("ВКонтакте", f"https://vk.com/{username}"),
+        ("TikTok",    f"https://www.tiktok.com/@{username}"),
+        ("Instagram", f"https://www.instagram.com/{username}/"),
+        ("Twitter/X", f"https://twitter.com/{username}"),
+    ]
+    results: list[tuple[str, bytes]] = []
+    async with httpx.AsyncClient(follow_redirects=True) as client:
+        for name, url in targets:
+            data = await _fetch_og_image(client, url)
+            if data:
+                results.append((name, data))
+            if len(results) >= 5:
+                break
+    return results
 
-class OSINTPDF(FPDF):
-    def header(self):
-        self.set_font("DejaVu", "B", 15)
-        self.set_text_color(25, 55, 140)
-        self.cell(0, 10, "🕵️ OSINT Досье", ln=True, align="C")
-        self.set_font("DejaVu", "", 11)
-        self.set_text_color(80, 80, 80)
-        self.cell(0, 6, f"Запрос: {getattr(self, 'query', '')}", ln=True, align="C")
-        self.ln(8)
+# ─── PDF генерация ────────────────────────────────────────────────────────────
+FONT_PATH      = "/tmp/DejaVuSans.ttf"
+FONT_BOLD_PATH = "/tmp/DejaVuSans-Bold.ttf"
+FONT_URL       = "https://cdn.jsdelivr.net/npm/dejavu-fonts-ttf@2.37.3/ttf/DejaVuSans.ttf"
+FONT_BOLD_URL  = "https://cdn.jsdelivr.net/npm/dejavu-fonts-ttf@2.37.3/ttf/DejaVuSans-Bold.ttf"
 
-    def footer(self):
-        self.set_y(-15)
-        self.set_font("DejaVu", "", 8)
-        self.set_text_color(120, 120, 120)
-        self.cell(0, 10, f"Сформировано: {datetime.now().strftime('%d.%m.%Y %H:%M')} • Действительно 24 часа", align="C")
+async def ensure_fonts():
+    """Скачивает шрифт с поддержкой кириллицы, если ещё не скачан или повреждён."""
+    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+        for path, url in [(FONT_PATH, FONT_URL), (FONT_BOLD_PATH, FONT_BOLD_URL)]:
+            # Скачиваем если нет или файл слишком мал (значит скачался не тот файл)
+            if not os.path.exists(path) or os.path.getsize(path) < 50_000:
+                log.info(f"Скачиваю шрифт: {url}")
+                r = await client.get(url)
+                r.raise_for_status()
+                with open(path, "wb") as f:
+                    f.write(r.content)
+                log.info(f"Шрифт сохранён: {path} ({len(r.content)} байт)")
 
-    def chapter_title(self, title):
-        self.set_font("DejaVu", "B", 13)
-        self.set_text_color(25, 55, 140)
-        self.cell(0, 10, title, ln=True)
-        self.ln(2)
-
-    def chapter_body(self, text: str):
-        self.set_font("DejaVu", "", 11)
-        self.set_text_color(40, 40, 40)
-        self.multi_cell(0, 6.5, text)
-        self.ln(3)
-
-
-def ensure_fonts():
-    """Проверка шрифта для русского языка"""
-    font_path = "DejaVuSans.ttf"
-    if not os.path.exists(font_path):
-        print("⚠️ DejaVuSans.ttf не найден. PDF будет с базовым шрифтом.")
-    return True
-
-
-def clean_text(text: str) -> str:
-    """Очистка текста для PDF"""
-    if not text:
-        return ""
-    text = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', text)  # убираем markdown ссылки
-    text = text.replace("✅", "✓").replace("❌", "✗").replace("⚠️", "!")
+def _clean(text: str) -> str:
+    """Убирает Markdown-символы и эмодзи для вставки в PDF (DejaVu не поддерживает emoji)."""
+    # Markdown
+    text = re.sub(r'[*_`]', '', text)
+    text = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', text)  # [text](url) → text
+    # Эмодзи и спецсимволы вне Latin/Cyrillic
+    text = re.sub(
+        r'[\U0001F000-\U0001FFFF'   # всякие эмодзи
+        r'\U00002600-\U000027BF'    # разные символы (☀✂ и др.)
+        r'\U0001F900-\U0001F9FF'    # дополнительные эмодзи
+        r'\U00002702-\U000027B0'
+        r'\U000024C2-\U0001F251'
+        r'\U0001FA00-\U0001FA6F'
+        r'\U0001FA70-\U0001FAFF'
+        r'\u200d\ufe0f\u20e3'       # zero-width joiner, variation selector
+        r']+',
+        '', text, flags=re.UNICODE
+    )
+    # Убираем лишние пробелы
+    text = re.sub(r'  +', ' ', text)
     return text.strip()
-
-
-def generate_osint_pdf(query: str, input_type: str, sections: list, photos: list = None, expires_at=None) -> bytes:
-    ensure_fonts()
-    pdf = OSINTPDF()
-    pdf.query = query
-    pdf.set_auto_page_break(auto=True, margin=15)
-    pdf.add_page()
-
-    # Шапка
-    pdf.set_font("DejaVu", "B", 18)
-    pdf.set_text_color(25, 55, 140)
-    pdf.cell(0, 12, "ПОЛНОЕ ОСИНТ ДОСЬЕ", ln=True, align="C")
-
-    pdf.set_font("DejaVu", "", 12)
-    pdf.set_text_color(60, 60, 60)
-    pdf.cell(0, 8, f"Запрос: {query}", ln=True, align="C")
-    pdf.cell(0, 8, f"Тип: {'📱 Телефон' if input_type == 'phone' else '📧 Email' if input_type == 'email' else '🔍 Никнейм'}", ln=True, align="C")
-    
-    if expires_at:
-        pdf.cell(0, 8, f"Действительно до: {expires_at.strftime('%d.%m.%Y %H:%M')}", ln=True, align="C")
-    pdf.ln(10)
-
-    # Основные секции
-    for section in sections:
-        pdf.chapter_title(section.get("title", "Информация"))
-        for line in section.get("lines", []):
-            cleaned = clean_text(line)
-            if cleaned:
-                if len(cleaned) > 300:  # длинные строки
-                    pdf.chapter_body(cleaned[:280] + "...")
-                else:
-                    pdf.chapter_body(cleaned)
-        pdf.ln(4)
-
-    # Фото профилей
-    if photos and len(photos) > 0:
-        pdf.add_page()
-        pdf.chapter_title("📸 Фото профилей")
-        x_start = 15
-        y = pdf.get_y()
-        for i, (platform, img_bytes) in enumerate(photos[:6]):
-            try:
-                with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
-                    tmp.write(img_bytes)
-                    tmp_path = tmp.name
-                
-                pdf.image(tmp_path, x=x_start + (i % 2) * 95, y=y, w=85, h=85)
-                os.unlink(tmp_path)
-                
-                pdf.set_xy(x_start + (i % 2) * 95, y + 88)
-                pdf.set_font("DejaVu", "B", 9)
-                pdf.cell(85, 6, platform, align="C")
-                
-                if i % 2 == 1:
-                    y += 105
-                    if y > 220:
-                        pdf.add_page()
-                        y = 20
-            except:
-                continue
-
-    pdf_bytes = pdf.output(dest='S').encode('latin1')
-    return pdf_bytes
 
 def generate_osint_pdf(
     query: str,
@@ -1258,24 +1228,6 @@ async def fn_full_search(query: str) -> tuple[list[str], list[dict], str]:
     )
     return tg_parts, pdf_sections, input_type
 
-# ─── Получение фото профилей ─────────────────────────────────────────────────
-async def fetch_profile_photos(username: str) -> list[tuple[str, bytes]]:
-    """Заглушка. Позже можно сделать реальный парсинг фото"""
-    photos = []
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            # Пример: VK
-            r = await client.get(f"https://vk.com/{username}", headers={"User-Agent": "Mozilla/5.0"})
-            if r.status_code == 200:
-                match = re.search(r'https?://[a-zA-Z0-9./_-]+\.(jpg|jpeg|png)', r.text)
-                if match:
-                    img_url = match.group(0)
-                    img_resp = await client.get(img_url)
-                    if img_resp.status_code == 200:
-                        photos.append(("VK", img_resp.content))
-    except:
-        pass
-    return photos
 
 async def _delete_pdf_later(bot: Bot, chat_id: int, message_id: int):
     """Удаляет PDF через 24 часа."""
@@ -1333,11 +1285,7 @@ async def h_full(msg: Message, state: FSMContext, bot: Bot):
         # Шаг 2 — ищем фото
         photos: list[tuple[str, bytes]] = []
         if nick_for_photos:
-            try:
-                photos = await fetch_profile_photos(nick_for_photos)  # если функция позже появится
-            except Exception as e:
-                log.error(f"Ошибка при получении фото: {e}")
-                photos = []
+            photos = await fetch_profile_photos(nick_for_photos)
 
         # Шаг 3 — генерируем PDF
         await w.edit_text("⏳ Шаг 3/3: генерирую PDF-отчёт...", parse_mode="Markdown")
