@@ -554,19 +554,23 @@ async def fetch_profile_photos(username: str) -> list[tuple[str, bytes]]:
     return results
 
 # ─── PDF генерация ────────────────────────────────────────────────────────────
-FONT_PATH = "/tmp/DejaVuSans.ttf"
+FONT_PATH      = "/tmp/DejaVuSans.ttf"
 FONT_BOLD_PATH = "/tmp/DejaVuSans-Bold.ttf"
-FONT_URL      = "https://github.com/dejavu-fonts/dejavu-fonts/raw/master/ttf/DejaVuSans.ttf"
-FONT_BOLD_URL = "https://github.com/dejavu-fonts/dejavu-fonts/raw/master/ttf/DejaVuSans-Bold.ttf"
+FONT_URL       = "https://cdn.jsdelivr.net/npm/dejavu-fonts-ttf@2.37.3/ttf/DejaVuSans.ttf"
+FONT_BOLD_URL  = "https://cdn.jsdelivr.net/npm/dejavu-fonts-ttf@2.37.3/ttf/DejaVuSans-Bold.ttf"
 
 async def ensure_fonts():
-    """Скачивает шрифт с поддержкой кириллицы, если ещё не скачан."""
+    """Скачивает шрифт с поддержкой кириллицы, если ещё не скачан или повреждён."""
     async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
         for path, url in [(FONT_PATH, FONT_URL), (FONT_BOLD_PATH, FONT_BOLD_URL)]:
-            if not os.path.exists(path):
+            # Скачиваем если нет или файл слишком мал (значит скачался не тот файл)
+            if not os.path.exists(path) or os.path.getsize(path) < 50_000:
+                log.info(f"Скачиваю шрифт: {url}")
                 r = await client.get(url)
+                r.raise_for_status()
                 with open(path, "wb") as f:
                     f.write(r.content)
+                log.info(f"Шрифт сохранён: {path} ({len(r.content)} байт)")
 
 def _clean(text: str) -> str:
     """Убирает Markdown-символы для вставки в PDF."""
