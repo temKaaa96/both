@@ -1258,6 +1258,24 @@ async def fn_full_search(query: str) -> tuple[list[str], list[dict], str]:
     )
     return tg_parts, pdf_sections, input_type
 
+# ─── Получение фото профилей ─────────────────────────────────────────────────
+async def fetch_profile_photos(username: str) -> list[tuple[str, bytes]]:
+    """Заглушка. Позже можно сделать реальный парсинг фото"""
+    photos = []
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            # Пример: VK
+            r = await client.get(f"https://vk.com/{username}", headers={"User-Agent": "Mozilla/5.0"})
+            if r.status_code == 200:
+                match = re.search(r'https?://[a-zA-Z0-9./_-]+\.(jpg|jpeg|png)', r.text)
+                if match:
+                    img_url = match.group(0)
+                    img_resp = await client.get(img_url)
+                    if img_resp.status_code == 200:
+                        photos.append(("VK", img_resp.content))
+    except:
+        pass
+    return photos
 
 async def _delete_pdf_later(bot: Bot, chat_id: int, message_id: int):
     """Удаляет PDF через 24 часа."""
