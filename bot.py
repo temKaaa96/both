@@ -25,7 +25,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 import httpx
 
-from config import BOT_TOKEN, BOT_USERNAME, ADMIN_ID
+from config import BOT_TOKEN, BOT_USERNAME, ADMIN_ID, DADATA_API_KEY, DADATA_SECRET_KEY
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -1254,8 +1254,46 @@ def detect_input_type(query: str) -> str:
     return "username"
 
 # ── Вспомогательные функции для карточки ─────────────────────────────────────
-def _phone_info(clean: str) -> tuple[str, str, str]:
-    """Возвращает (оператор, регион, страна) по номеру."""
+async def _phone_info_dadata(phone: str) -> dict:
+    """
+    Запрашивает данные о номере через DaData API.
+    Возвращает словарь с полями: operator, region, city, country, timezone, phone_type.
+    Если ключи не заданы или запрос не удался — возвращает пустой dict.
+    """
+    if not DADATA_API_KEY or not DADATA_SECRET_KEY:
+        return {}
+    try:
+        async with httpx.AsyncClient(timeout=8) as client:
+            r = await client.post(
+                "https://cleaner.dadata.ru/api/v1/clean/phone",
+                headers={
+                    "Content-Type":  "application/json",
+                    "Accept":        "application/json",
+                    "Authorization": f"Token {DADATA_API_KEY}",
+                    "X-Secret":      DADATA_SECRET_KEY,
+                },
+                json=[phone],
+            )
+            if r.status_code == 200:
+                data = r.json()
+                if data and isinstance(data, list):
+                    d = data[0]
+                    return {
+                        "phone":      d.get("phone", phone),
+                        "operator":   d.get("provider", ""),
+                        "region":     d.get("region", ""),
+                        "city":       d.get("city", ""),
+                        "country":    d.get("country", ""),
+                        "timezone":   d.get("timezone", ""),
+                        "phone_type": d.get("type", ""),
+                        "qc":         d.get("qc", -1),
+                    }
+    except Exception as e:
+        log.warning(f"DaData error: {e}")
+    return {}
+
+def _phone_info_local(clean: str) -> tuple[str, str, str]:
+    """Fallback: оператор/регион/страна из локальной таблицы."""
     if clean.startswith('+7') and len(clean) == 12:
         code = clean[2:5]
         op   = OPERATORS_RU.get(code, 'Неизвестный оператор')
@@ -1409,16 +1447,41 @@ async def fn_full_search(query: str) -> tuple[str, list[dict], str]:
         clean      = re.sub(r'[^\d+]', '', q)
         if not clean.startswith('+'): clean = '+7' + clean[1:] if clean.startswith('8') else '+' + clean
         num_digits = re.sub(r'[^\d]', '', clean)
-        op, region, country = _phone_info(clean)
 
-        phone_block = (
-            f"📱 Телефон: `{clean}`\n"
-            f"├ Оператор: {op}\n"
-            f"├ Регион: {region}\n"
-            f"└ Страна: {country}\n"
-        )
-        pdf_lines = [f"Телефон: {clean}", f"Оператор: {op}",
-                     f"Регион: {region}", f"Страна: {country}"]
+        # Пробуем DaData, fallback на локальную таблицу
+        dd = await _phone_info_dadata(clean)
+        if dd:
+            op      = dd["operator"] or "—"
+            region  = dd["city"] or dd["region"] or "—"
+            country = dd["country"] or "—"
+            tz      = dd["timezone"] or ""
+            ptype   = dd["phone_type"] or ""
+            norm    = dd["phone"] or clean
+
+            phone_block = (
+                f"📱 Телефон: `{norm}`\n"
+                f"├ Тип: {ptype}\n"
+                f"├ Оператор: {op}\n"
+                f"├ Регион: {region}\n"
+                f"├ Страна: {country}\n"
+                + (f"└ Часовой пояс: {tz}\n" if tz else "")
+            )
+            pdf_lines = [
+                f"Телефон: {norm}", f"Тип: {ptype}",
+                f"Оператор: {op}", f"Регион: {region}",
+                f"Страна: {country}", f"Часовой пояс: {tz}",
+            ]
+        else:
+            # Локальный fallback
+            op, region, country = _phone_info_local(clean)
+            phone_block = (
+                f"📱 Телефон: `{clean}`\n"
+                f"├ Оператор: {op}\n"
+                f"├ Регион: {region}\n"
+                f"└ Страна: {country}\n"
+            )
+            pdf_lines = [f"Телефон: {clean}", f"Оператор: {op}",
+                         f"Регион: {region}", f"Страна: {country}"]
 
         # Параллельно проверяем реальные источники
         tg_res, vk_res, avito_res = await asyncio.gather(
