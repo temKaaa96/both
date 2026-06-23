@@ -602,177 +602,327 @@ def generate_osint_pdf(
     expires_at: datetime,
 ) -> bytes:
     """
-    Генерирует PDF-досье и возвращает байты.
-    Простой надёжный макет без сложного позиционирования.
+    PDF-досье в стиле Sherlock Report:
+    - белый фон, чистая типографика
+    - шапка с логотипом и аватаром
+    - оглавление
+    - секции с таблицами ключ-значение
+    - теги для возможных имён
     """
-    from fpdf import FPDF
+    from fpdf import FPDF, XPos, YPos
 
-    TYPE_LABELS = {"phone": "Телефон", "email": "Email", "username": "Ник / Username"}
-    exp_str    = expires_at.strftime("%d.%m.%Y %H:%M")
-    now_str    = datetime.now().strftime("%d.%m.%Y %H:%M")
-    W          = 180   # ширина контентной зоны (A4=210 - 2*15 отступов)
+    # Палитра (Sherlock-стиль: минималистичная, светлая)
+    WHITE    = (255, 255, 255)
+    BG       = (248, 249, 250)   # очень светло-серый фон строк
+    DARK     = (25,  25,  25)    # основной текст
+    MID      = (90,  90,  90)    # метки/ключи
+    LIGHT_LINE = (220, 220, 220) # линии-разделители
+    ACCENT   = (30,  30,  30)    # заголовки секций
+    TAG_BG   = (240, 240, 240)   # фон тегов имён
+    TAG_FG   = (50,  50,  50)    # текст тегов
+    LOGO_COL = (20,  20,  20)    # OSINT (тёмный)
+    SUB_COL  = (130, 130, 130)   # Report (серый)
+    YEAR_COL = (160, 160, 160)   # год рядом с заголовком
 
-    class PDF(FPDF):
+    exp_str = expires_at.strftime("%d.%m.%Y %H:%M")
+    now_str = datetime.now().strftime("%d.%m.%Y %H:%M")
+    W   = 180   # контентная ширина при полях 15мм
+    COL1 = 58   # ширина колонки-ключа
+    COL2 = W - COL1
+
+    TYPE_LABELS = {"phone": "Телефон", "email": "Email", "username": "Username / Ник"}
+
+    # ── PDF класс с колонтитулами ─────────────────────────────────────────────
+    class ReportPDF(FPDF):
         def header(self):
             self.set_left_margin(15)
             self.set_right_margin(15)
-            self.set_font("DejaVu", size=8)
-            self.set_text_color(140, 140, 140)
-            self.cell(W, 6, "OSINT Bot — автоматизированный отчёт. Только для законного использования.", align="C", new_x="LMARGIN", new_y="NEXT")
-            self.set_draw_color(180, 180, 180)
-            self.line(15, self.get_y(), 195, self.get_y())
-            self.ln(3)
+            # Логотип "OSINT Report"
+            self.set_xy(15, 8)
+            self.set_font("Bold", size=11)
+            self.set_text_color(*LOGO_COL)
+            self.cell(22, 7, "OSINT")
+            self.set_font("Reg", size=11)
+            self.set_text_color(*SUB_COL)
+            self.cell(20, 7, " Report", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            # Горизонтальная линия под шапкой
+            self.set_draw_color(*LIGHT_LINE)
+            self.line(15, 17, 195, 17)
+            self.ln(4)
 
         def footer(self):
-            self.set_y(-14)
+            self.set_y(-13)
+            self.set_draw_color(*LIGHT_LINE)
+            self.line(15, self.get_y(), 195, self.get_y())
+            self.set_font("Reg", size=7.5)
+            self.set_text_color(*MID)
             self.set_left_margin(15)
-            self.set_right_margin(15)
-            self.set_font("DejaVu", size=8)
-            self.set_text_color(140, 140, 140)
-            self.cell(W, 8, f"стр. {self.page_no()}   |   Действителен до: {exp_str}   |   Создан: {now_str}", align="C")
+            self.cell(W // 2, 7, f"Создан: {now_str}   |   Действителен до: {exp_str}")
+            self.cell(W // 2, 7, f"стр. {self.page_no()}", align="R")
 
-    pdf = PDF()
-    pdf.add_font("DejaVu",          fname=FONT_PATH)
-    pdf.add_font("DejaVu", style="B", fname=FONT_BOLD_PATH)
+    pdf = ReportPDF()
+    pdf.add_font("Reg",  fname=FONT_PATH)
+    pdf.add_font("Bold", fname=FONT_BOLD_PATH)
     pdf.set_left_margin(15)
     pdf.set_right_margin(15)
-    pdf.set_top_margin(15)
-    pdf.set_auto_page_break(auto=True, margin=18)
+    pdf.set_top_margin(22)
+    pdf.set_auto_page_break(auto=True, margin=16)
 
-    # ── Титул ────────────────────────────────────────────────────────────────
+    # ── Вспомогательные функции ───────────────────────────────────────────────
+    def sec_title(title: str, subtitle: str = ""):
+        """Заголовок секции как в Sherlock: жирный + год/источник серым."""
+        pdf.set_x(15)
+        pdf.set_font("Bold", size=13)
+        pdf.set_text_color(*ACCENT)
+        tw = pdf.get_string_width(title)
+        pdf.cell(tw + 2, 9, title)
+        if subtitle:
+            pdf.set_font("Reg", size=10)
+            pdf.set_text_color(*YEAR_COL)
+            pdf.cell(30, 9, f" {subtitle}")
+        pdf.ln(9)
+        pdf.set_draw_color(*LIGHT_LINE)
+        pdf.line(15, pdf.get_y(), 195, pdf.get_y())
+        pdf.ln(4)
+
+    def kv(key: str, value: str, shade: bool = False):
+        """Строка ключ — значение."""
+        if shade:
+            pdf.set_fill_color(*BG)
+        else:
+            pdf.set_fill_color(*WHITE)
+        pdf.set_x(15)
+        pdf.set_font("Reg", size=9)
+        pdf.set_text_color(*MID)
+        pdf.cell(COL1, 7, key[:35], fill=True)
+        pdf.set_font("Reg", size=9)
+        pdf.set_text_color(*DARK)
+        # Обрезаем значение если слишком длинное
+        val = value[:80] if len(value) > 80 else value
+        pdf.cell(COL2, 7, val, fill=True, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+
+    def tbl_header(cols: list[tuple[str, float]]):
+        """Шапка таблицы: серые метки."""
+        pdf.set_x(15)
+        pdf.set_font("Reg", size=8.5)
+        pdf.set_text_color(*MID)
+        pdf.set_draw_color(*LIGHT_LINE)
+        for label, w in cols:
+            pdf.cell(w, 6, label)
+        pdf.ln(6)
+        pdf.set_draw_color(*LIGHT_LINE)
+        pdf.line(15, pdf.get_y(), 195, pdf.get_y())
+        pdf.ln(1)
+
+    def tbl_row(cells: list[tuple[str, float]], shade: bool):
+        pdf.set_x(15)
+        pdf.set_font("Reg", size=9)
+        pdf.set_text_color(*DARK)
+        pdf.set_fill_color(*BG if shade else WHITE)
+        for val, w in cells:
+            pdf.cell(w, 6.5, str(val)[:55], fill=True)
+        pdf.ln(6.5)
+
+    def draw_tags(items: list[str]):
+        """Рисует теги-чипы как в Sherlock (возможные имена)."""
+        pdf.set_font("Reg", size=9)
+        x, y = 15.0, pdf.get_y()
+        line_h = 8.0
+        gap_x  = 3.0
+
+        for item in items:
+            tw = pdf.get_string_width(item) + 6
+            if x + tw > 193:
+                x  = 15.0
+                y += line_h + 2
+
+            # Рамка тега
+            pdf.set_draw_color(*LIGHT_LINE)
+            pdf.set_fill_color(*TAG_BG)
+            pdf.rect(x, y, tw, line_h - 1, style="FD")
+            pdf.set_xy(x + 3, y + 1)
+            pdf.set_text_color(*TAG_FG)
+            pdf.cell(tw - 6, line_h - 3, item)
+            x += tw + gap_x
+
+        pdf.set_y(y + line_h + 2)
+
+    # ════════════════════════════════════════════════════════════════════
+    # Страница 1: шапка — аватар + основные данные
+    # ════════════════════════════════════════════════════════════════════
     pdf.add_page()
 
-    pdf.set_font("DejaVu", style="B", size=24)
-    pdf.set_text_color(15, 15, 50)
-    pdf.cell(W, 14, "OSINT ДОСЬЕ", align="C", new_x="LMARGIN", new_y="NEXT")
+    top_y = pdf.get_y()
 
-    pdf.set_draw_color(15, 15, 50)
-    pdf.set_line_width(0.8)
-    pdf.line(15, pdf.get_y(), 195, pdf.get_y())
-    pdf.set_line_width(0.2)
-    pdf.ln(5)
-
-    pdf.set_font("DejaVu", size=12)
-    pdf.set_text_color(60, 60, 60)
-    pdf.cell(W, 8, "Разведка по открытым источникам", align="C", new_x="LMARGIN", new_y="NEXT")
-    pdf.ln(6)
-
-    info_lines = [
-        f"Запрос:      {_clean(query)}",
-        f"Тип данных:  {TYPE_LABELS.get(input_type, input_type)}",
-        f"Создан:      {now_str}",
-        f"Действителен до: {exp_str}",
-    ]
-    pdf.set_font("DejaVu", size=11)
-    pdf.set_text_color(30, 30, 30)
-    for line in info_lines:
-        pdf.cell(W, 7, line, new_x="LMARGIN", new_y="NEXT")
-
-    pdf.ln(6)
-    pdf.set_font("DejaVu", size=9)
-    pdf.set_text_color(160, 0, 0)
-    pdf.cell(W, 6, "ВНИМАНИЕ: файл действителен 24 часа и будет удалён автоматически.", align="C", new_x="LMARGIN", new_y="NEXT")
-
-    pdf.ln(8)
-    pdf.set_draw_color(200, 200, 200)
-    pdf.line(15, pdf.get_y(), 195, pdf.get_y())
-    pdf.ln(4)
-    pdf.set_font("DejaVu", size=8)
-    pdf.set_text_color(140, 140, 140)
-    pdf.multi_cell(W, 5,
-        "Данный отчёт создан автоматически на основе открытых источников данных. "
-        "Использование в незаконных целях запрещено. "
-        "Точность данных не гарантируется — проверяйте информацию в первоисточниках.",
-        align="C"
-    )
-
-    # ── Фотографии ───────────────────────────────────────────────────────────
+    # Аватар (первое фото, если есть)
+    avatar_placed = False
     if photos:
-        pdf.add_page()
-        pdf.set_font("DejaVu", style="B", size=14)
-        pdf.set_text_color(15, 15, 50)
-        pdf.cell(W, 10, "Найденные фотографии профилей", new_x="LMARGIN", new_y="NEXT")
-        pdf.set_draw_color(15, 15, 50)
-        pdf.set_line_width(0.5)
-        pdf.line(15, pdf.get_y(), 195, pdf.get_y())
-        pdf.set_line_width(0.2)
-        pdf.ln(5)
+        try:
+            plat, img_bytes = photos[0]
+            ext = "PNG" if img_bytes[:3] == b'\x89PN' else "JPEG"
+            with tempfile.NamedTemporaryFile(suffix=f".{ext.lower()}", delete=False) as tmp:
+                tmp.write(img_bytes)
+                tmp_path = tmp.name
+            # Скруглённая рамка (имитация) — просто светло-серый квадрат
+            pdf.set_fill_color(*BG)
+            pdf.rect(15, top_y, 34, 34, style="F")
+            pdf.image(tmp_path, x=16, y=top_y + 1, w=32, h=32)
+            os.unlink(tmp_path)
+            avatar_placed = True
+        except Exception:
+            pass
 
-        col, row = 0, 0
-        img_w, img_h, gap = 80, 75, 8
-        x_base = [15, 110]
+    # Основной запрос крупно
+    text_x = 55 if avatar_placed else 15
+    text_w = W - (40 if avatar_placed else 0)
+
+    pdf.set_xy(text_x, top_y + 3)
+    pdf.set_font("Bold", size=22)
+    pdf.set_text_color(*DARK)
+    pdf.cell(text_w, 12, _clean(query)[:40])
+    pdf.set_xy(text_x, top_y + 16)
+    pdf.set_font("Reg", size=10)
+    pdf.set_text_color(*MID)
+    lbl = TYPE_LABELS.get(input_type, input_type)
+    pdf.cell(text_w, 7, lbl)
+    pdf.ln(24)
+
+    # Краткая сводка — первая секция
+    sec_title("Краткая сводка")
+
+    shade = False
+    kv("Запрос",          _clean(query),                         shade); shade = not shade
+    kv("Тип данных",      TYPE_LABELS.get(input_type, input_type), shade); shade = not shade
+    kv("Дата отчёта",     now_str,                               shade); shade = not shade
+    kv("Действителен до", exp_str,                               shade)
+    pdf.ln(6)
+
+    pdf.set_x(15)
+    pdf.set_font("Reg", size=7.5)
+    pdf.set_text_color(*MID)
+    pdf.multi_cell(W, 4.5,
+        "Данный отчёт создан автоматически на основе открытых источников. "
+        "Точность не гарантируется. Использование в незаконных целях запрещено.",
+        align="C")
+
+    # ════════════════════════════════════════════════════════════════════
+    # Страница 2+: фотографии профилей (если есть несколько)
+    # ════════════════════════════════════════════════════════════════════
+    if len(photos) > 1:
+        pdf.add_page()
+        sec_title("Фотографии профилей")
+
+        col_x = [15.0, 105.0]
+        col   = 0
+        row_y = pdf.get_y()
 
         for platform_name, img_bytes in photos:
             try:
-                header4 = img_bytes[:4]
-                ext = "PNG" if header4[:3] == b'\x89PN' else "JPEG"
+                ext = "PNG" if img_bytes[:3] == b'\x89PN' else "JPEG"
                 with tempfile.NamedTemporaryFile(suffix=f".{ext.lower()}", delete=False) as tmp:
                     tmp.write(img_bytes)
                     tmp_path = tmp.name
 
-                x = x_base[col]
-                y = 50 + row * (img_h + gap + 8)
+                x = col_x[col]
+                y = row_y
 
-                pdf.image(tmp_path, x=x, y=y, w=img_w, h=img_h)
-                pdf.set_xy(x, y + img_h + 1)
-                pdf.set_font("DejaVu", style="B", size=9)
-                pdf.set_text_color(15, 15, 50)
-                pdf.cell(img_w, 6, _clean(platform_name), align="C")
+                # Светлый фон-плашка
+                pdf.set_fill_color(*BG)
+                pdf.rect(x, y, 82, 78, style="F")
+                pdf.image(tmp_path, x=x + 1, y=y + 1, w=80, h=72)
+
+                # Подпись
+                pdf.set_xy(x, y + 74)
+                pdf.set_font("Bold", size=8.5)
+                pdf.set_text_color(*DARK)
+                pdf.cell(82, 5, _clean(platform_name), align="C")
 
                 os.unlink(tmp_path)
                 col += 1
                 if col >= 2:
-                    col = 0
-                    row += 1
+                    col   = 0
+                    row_y += 86
+                    pdf.set_y(row_y)
             except Exception:
                 pass
 
-    # ── Разделы с данными ────────────────────────────────────────────────────
-    for section in sections:
+    # ════════════════════════════════════════════════════════════════════
+    # Секции с данными
+    # ════════════════════════════════════════════════════════════════════
+    for sec in sections:
         pdf.add_page()
-        pdf.set_left_margin(15)
-        pdf.set_right_margin(15)
 
-        # Заголовок
-        pdf.set_font("DejaVu", style="B", size=13)
-        pdf.set_text_color(15, 15, 50)
-        title = _clean(section.get("title", ""))
-        pdf.cell(W, 10, title, new_x="LMARGIN", new_y="NEXT")
-        pdf.set_draw_color(15, 15, 50)
-        pdf.set_line_width(0.5)
-        pdf.line(15, pdf.get_y(), 195, pdf.get_y())
-        pdf.set_line_width(0.2)
-        pdf.ln(2)
+        raw_title  = _clean(sec.get("title",  ""))
+        raw_source = _clean(sec.get("source", ""))
+        lines      = sec.get("lines", [])
 
-        # Источник
-        pdf.set_font("DejaVu", size=8)
-        pdf.set_text_color(120, 120, 120)
-        source = _clean(section.get("source", "Открытые источники"))
-        pdf.cell(W, 5, f"Источник: {source}", new_x="LMARGIN", new_y="NEXT")
-        pdf.set_draw_color(210, 210, 210)
-        pdf.line(15, pdf.get_y(), 195, pdf.get_y())
-        pdf.ln(4)
+        # Разделяем заголовок и год если есть (формат "Заголовок 2024")
+        year_match = re.search(r'\b(20\d{2})\b', raw_title)
+        if year_match:
+            year      = year_match.group(1)
+            clean_ttl = raw_title[:year_match.start()].strip()
+        else:
+            year      = raw_source[:30] if raw_source else ""
+            clean_ttl = raw_title
 
-        # Строки содержимого
-        pdf.set_font("DejaVu", size=10)
-        pdf.set_text_color(30, 30, 30)
-        for raw_line in section.get("lines", []):
-            line = _clean(raw_line)
-            if not line:
-                pdf.ln(1)
+        sec_title(clean_ttl, year)
+
+        # Парсим строки в пары ключ-значение
+        pairs: list[tuple[str, str]] = []
+        tags:  list[str]             = []
+        other: list[str]             = []
+
+        for raw in lines:
+            cl = _clean(raw).strip().lstrip("- ")
+            if not cl or (cl.startswith("http") and len(cl) > 80):
                 continue
-            # Длинные URL — пропускаем
-            if line.startswith("http") and len(line) > 100:
+
+            stripped = cl.lstrip("• ")
+
+            # Ключ: значение
+            if ":" in stripped:
+                k, _, v = stripped.partition(":")
+                k, v = k.strip(), v.strip()
+                if k and v and len(k) < 40 and "\n" not in k:
+                    pairs.append((k, v))
+                    continue
+
+            # Короткое слово/фраза без двоеточия — тег
+            if len(stripped) < 30 and " " not in stripped[:10]:
+                tags.append(stripped)
                 continue
-            try:
-                pdf.set_x(15)
-                pdf.multi_cell(W, 5.5, line, align="L")
-            except Exception:
-                pass
+
+            other.append(cl)
+
+        # Рендер пар как таблица
+        if pairs:
+            shade = False
+            for k, v in pairs:
+                kv(k, v, shade)
+                shade = not shade
+            pdf.ln(4)
+
+        # Теги (возможные имена и т.п.)
+        if tags:
+            draw_tags(tags)
+            pdf.ln(3)
+
+        # Остальные строки
+        if other:
+            pdf.set_font("Reg", size=9.5)
+            pdf.set_text_color(*DARK)
+            for line in other:
+                try:
+                    pdf.set_x(15)
+                    pdf.multi_cell(W, 5.5, line, align="L")
+                except Exception:
+                    pass
 
     return bytes(pdf.output())
 
 # ─── Главный хендлер ─────────────────────────────────────────────────────────
+# ─── Главный хендлер ─────────────────────────────────────────────────────────
+
 dp = Dispatcher(storage=MemoryStorage())
 
 WELCOME = (
