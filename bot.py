@@ -1253,7 +1253,205 @@ def detect_input_type(query: str) -> str:
         return "email"
     return "username"
 
-async def fn_full_search(query: str) -> tuple[list[str], list[dict], str]:
+# ── Вспомогательные функции для карточки ─────────────────────────────────────
+def _phone_info(clean: str) -> tuple[str, str, str]:
+    """Возвращает (оператор, регион, страна) по номеру."""
+    if clean.startswith('+7') and len(clean) == 12:
+        code = clean[2:5]
+        op   = OPERATORS_RU.get(code, 'Неизвестный оператор')
+        # Таблица регионов по первым 5 цифрам
+        REGIONS = {
+            "916": "Москва и МО", "917": "Москва и МО", "925": "Москва и МО",
+            "926": "Москва и МО", "903": "Москва и МО", "905": "Москва и МО",
+            "906": "Москва и МО", "909": "Москва и МО", "910": "Центр РФ",
+            "911": "Северо-Запад", "912": "Урал", "913": "Сибирь",
+            "914": "Дальний Восток", "918": "Юг России", "919": "Сибирь",
+            "920": "Центр РФ", "921": "Северо-Запад", "922": "Урал",
+            "923": "Сибирь", "924": "Дальний Восток", "927": "Поволжье",
+            "928": "Юг России", "929": "Центр РФ", "930": "Центр РФ",
+            "931": "Северо-Запад", "932": "Урал", "933": "Юг России",
+            "934": "Поволжье", "936": "Центр РФ", "937": "Поволжье",
+            "938": "Юг России", "939": "Поволжье", "950": "Урал",
+            "951": "Урал", "952": "Урал", "953": "Сибирь",
+            "958": "Москва и МО", "960": "Центр РФ", "961": "Юг России",
+            "962": "Поволжье", "963": "Юг России", "964": "Дальний Восток",
+            "965": "Москва и МО", "967": "Москва и МО", "968": "Москва и МО",
+            "977": "Москва и МО", "980": "Центр РФ", "981": "Северо-Запад",
+            "982": "Урал", "985": "Москва и МО", "987": "Поволжье",
+            "988": "Юг России", "989": "Юг России", "993": "Москва и МО",
+            "995": "Москва и МО", "996": "Урал", "999": "Москва и МО",
+        }
+        region = REGIONS.get(code, "Россия")
+        return op, region, "Россия"
+    if clean.startswith('+380'): return "—", "—", "Украина"
+    if clean.startswith('+375'): return "—", "—", "Беларусь"
+    if clean.startswith('+7'):   return "—", "—", "Россия / Казахстан"
+    return "—", "—", "Международный"
+
+async def _check_social_profiles(nick: str) -> list[tuple[str, str, str]]:
+    """
+    Проверяет публичные профили на платформах.
+    Возвращает список (платформа, отображаемое имя, url).
+    """
+    TARGETS = [
+        ("ВКонтакте",  f"https://vk.com/{nick}",              r'<title>([^<|—]+)'),
+        ("Instagram",  f"https://www.instagram.com/{nick}/",   r'"full_name":"([^"]+)"'),
+        ("TikTok",     f"https://www.tiktok.com/@{nick}",      r'"nickname":"([^"]+)"'),
+        ("GitHub",     f"https://github.com/{nick}",           r'<title>([^·<]+)'),
+        ("Twitter/X",  f"https://twitter.com/{nick}",          r'<title>([^(·<]+)'),
+        ("YouTube",    f"https://www.youtube.com/@{nick}",     r'<title>([^-<·]+)'),
+        ("Telegram",   f"https://t.me/{nick}",                 r'og:title" content="([^"]+)"'),
+        ("Pinterest",  f"https://www.pinterest.com/{nick}/",   r'<title>([^(|<]+)'),
+        ("Twitch",     f"https://www.twitch.tv/{nick}",        r'<title>([^-<·]+)'),
+        ("Steam",      f"https://steamcommunity.com/id/{nick}",r'<title>([^-<·]+)'),
+        ("Reddit",     f"https://www.reddit.com/user/{nick}/", r'<title>([^-<·]+)'),
+    ]
+    found = []
+    async with httpx.AsyncClient(
+        timeout=8, follow_redirects=True,
+        headers={"User-Agent": "Mozilla/5.0 (compatible; OSINT-Bot)"}
+    ) as client:
+        async def _check(platform, url, pattern):
+            try:
+                r = await client.get(url)
+                if r.status_code == 200 and 'not found' not in r.text.lower()[:500]:
+                    m = re.search(pattern, r.text, re.IGNORECASE)
+                    name = m.group(1).strip() if m else nick
+                    # Фильтруем мусор
+                    if len(name) > 1 and name.lower() not in ('page not found', '404', 'error'):
+                        found.append((platform, name[:40], url))
+            except Exception:
+                pass
+
+        tasks = [_check(p, u, r) for p, u, r in TARGETS]
+        await asyncio.gather(*tasks)
+    return found
+
+async def fn_full_search(query: str) -> tuple[str, list[dict], str]:
+    """
+    Собирает полное досье и возвращает (card_text, pdf_sections, input_type).
+    card_text — компактная карточка в стиле скриншота.
+    """
+    q          = query.strip()
+    input_type = detect_input_type(q)
+    pdf_sections: list[dict] = []
+
+    # ── Блоки карточки ────────────────────────────────────────────────────────
+    phone_block  = ""
+    profiles_block = ""
+    tg_block     = ""
+    email_block  = ""
+    nick_for_search = None
+
+    if input_type == "phone":
+        clean      = re.sub(r'[^\d+]', '', q)
+        if not clean.startswith('+'): clean = '+7' + clean[1:] if clean.startswith('8') else '+' + clean
+        num_digits = re.sub(r'[^\d]', '', clean)
+        op, region, country = _phone_info(clean)
+
+        phone_block = (
+            f"📱 Телефон: `{clean}`\n"
+            f"├ Оператор: {op}\n"
+            f"├ Регион: {region}\n"
+            f"└ Страна: {country}\n"
+        )
+        pdf_sections.append({
+            "title": "Телефонный номер",
+            "source": "Открытая база операторов РФ",
+            "lines": [f"Телефон: {clean}", f"Оператор: {op}",
+                      f"Регион: {region}", f"Страна: {country}"],
+        })
+
+        # Ссылки для ручной проверки
+        tg_block = (
+            f"💬 Telegram: [открыть профиль](https://t.me/+{num_digits})\n"
+            f"🔎 GetContact: [поиск имён](https://getcontact.com/ru/{num_digits})\n"
+            f"📖 NumBuster: [телефонная книга](https://numbuster.com/number/{num_digits})\n"
+            f"👤 ВКонтакте: [поиск по номеру](https://vk.com/search?c[section]=people&c[phone]={num_digits})\n"
+        )
+        pdf_sections.append({
+            "title": "Ссылки для проверки",
+            "source": "Открытые сервисы",
+            "lines": [
+                f"Telegram: https://t.me/+{num_digits}",
+                f"GetContact: https://getcontact.com/ru/{num_digits}",
+                f"NumBuster: https://numbuster.com/number/{num_digits}",
+                f"VK поиск по номеру: https://vk.com/search?c[section]=people&c[phone]={num_digits}",
+            ],
+        })
+
+    elif input_type == "email":
+        domain = q.split('@')[1]
+        known  = {
+            'gmail.com':'Google Gmail','yahoo.com':'Yahoo','mail.ru':'Mail.ru',
+            'yandex.ru':'Яндекс','yandex.com':'Яндекс','outlook.com':'Microsoft',
+            'icloud.com':'Apple iCloud','rambler.ru':'Rambler',
+            'bk.ru':'Mail.ru','list.ru':'Mail.ru','inbox.ru':'Mail.ru',
+        }
+        provider = known.get(domain, domain)
+        nick_for_search = q.split('@')[0]
+
+        email_block = (
+            f"📧 Email: `{q}`\n"
+            f"├ Провайдер: {provider}\n"
+            f"├ Утечки: [HaveIBeenPwned](https://haveibeenpwned.com/account/{q})\n"
+            f"└ Ник из email: `{nick_for_search}`\n"
+        )
+        pdf_sections.append({
+            "title": "Email",
+            "source": "Анализ домена + HaveIBeenPwned",
+            "lines": [f"Email: {q}", f"Провайдер: {provider}",
+                      f"Ник: {nick_for_search}"],
+        })
+
+    else:
+        nick_for_search = q.lstrip('@')
+
+    # ── Поиск профилей по нику ────────────────────────────────────────────────
+    social_profiles: list[tuple[str, str, str]] = []
+    if nick_for_search:
+        social_profiles = await _check_social_profiles(nick_for_search)
+
+        if social_profiles:
+            lines_pdf = []
+            lines_tg  = []
+            for platform, name, url in social_profiles:
+                lines_tg.append(f"👤 {platform}: [{name}]({url})")
+                lines_pdf.append(f"{platform}: {name} — {url}")
+            profiles_block = "\n".join(lines_tg) + "\n"
+            pdf_sections.append({
+                "title": "Профили в интернете",
+                "source": "Прямая проверка по публичным URL",
+                "lines": lines_pdf,
+            })
+        else:
+            profiles_block = "❌ Публичных профилей не найдено\n"
+
+    # ── Сборка карточки ───────────────────────────────────────────────────────
+    type_icons = {"phone": "📱", "email": "📧", "username": "🔍"}
+    card = (
+        f"⬤ *Обнаружен идентификатор:* `{q}`\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+    )
+    if phone_block:
+        card += f"\n{phone_block}"
+    if email_block:
+        card += f"\n{email_block}"
+    if profiles_block:
+        n = len(social_profiles)
+        card += f"\n🌐 *Профили в интернете ({n} найдено):*\n{profiles_block}"
+    if tg_block:
+        card += f"\n🔗 *Полезные ссылки:*\n{tg_block}"
+
+    card += (
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"🕵️ Интересовались этим: *—*\n"
+        f"📄 Генерирую PDF-отчёт... ⏳"
+    )
+
+    return card, pdf_sections, input_type
+
+
     """
     Запускает все релевантные поиски по одному идентификатору.
     Возвращает (telegram_parts, pdf_sections, input_type).
@@ -1412,59 +1610,41 @@ async def h_full(msg: Message, state: FSMContext, bot: Bot):
     use_request(msg.from_user.id)
     log_search(msg.from_user.id, "full_search", q)
 
-    w = await msg.answer(
-        "🗂 Собираю полное досье...\n\n"
-        "⏳ Шаг 1/3: поиск по источникам",
-        parse_mode="Markdown"
-    )
+    w = await msg.answer("🔎 Ищу данные...", parse_mode="Markdown")
 
     try:
-        tg_parts, pdf_sections, input_type = await fn_full_search(q)
+        # Шаг 1: собираем данные и карточку
+        card_text, pdf_sections, input_type = await fn_full_search(q)
 
-        # Шаг 1 — отправляем текстовые части
-        await w.edit_text("⏳ Шаг 2/3: ищу фотографии профилей...", parse_mode="Markdown")
-
-        # Определяем ник для поиска фото
-        if input_type == "phone":
-            nick_for_photos = None
-        elif input_type == "email":
-            nick_for_photos = q.split('@')[0]
-        else:
-            nick_for_photos = q.strip().lstrip('@')
-
-        # Шаг 2 — ищем фото
+        # Шаг 2: ищем фото профилей
+        await w.edit_text("📸 Ищу фото профилей...", parse_mode="Markdown")
+        nick_for_photos = (
+            None if input_type == "phone"
+            else q.split('@')[0] if input_type == "email"
+            else q.strip().lstrip('@')
+        )
         photos: list[tuple[str, bytes]] = []
         if nick_for_photos:
             photos = await fetch_profile_photos(nick_for_photos)
 
-        # Шаг 3 — генерируем PDF
-        await w.edit_text("⏳ Шаг 3/3: генерирую PDF-отчёт...", parse_mode="Markdown")
+        # Шаг 3: генерируем PDF
+        await w.edit_text("📄 Генерирую PDF-отчёт...", parse_mode="Markdown")
         await ensure_fonts()
-
         expires_at = datetime.now() + timedelta(hours=24)
         pdf_bytes = generate_osint_pdf(
-            query=q,
-            input_type=input_type,
-            sections=pdf_sections,
-            photos=photos,
+            query=q, input_type=input_type,
+            sections=pdf_sections, photos=photos,
             expires_at=expires_at,
         )
 
         await w.delete()
 
-        # Отправляем текстовые части
-        for part in tg_parts:
-            if part and part.strip():
-                try:
-                    await msg.answer(part, parse_mode="Markdown", disable_web_page_preview=True)
-                except Exception:
-                    chunks = [part[i:i+3500] for i in range(0, len(part), 3500)]
-                    for chunk in chunks:
-                        await msg.answer(chunk, parse_mode="Markdown", disable_web_page_preview=True)
+        # Отправляем карточку (убираем строку про PDF из текста)
+        clean_card = card_text.replace("📄 Генерирую PDF-отчёт... ⏳", "").rstrip()
+        await msg.answer(clean_card, parse_mode="Markdown", disable_web_page_preview=True)
 
-        # Отправляем фото (если нашли)
+        # Фото профилей (если нашли)
         if photos:
-            await msg.answer(f"📸 *Найдено фотографий профилей: {len(photos)}*", parse_mode="Markdown")
             for platform_name, img_bytes in photos:
                 try:
                     await msg.answer_photo(
@@ -1474,20 +1654,16 @@ async def h_full(msg: Message, state: FSMContext, bot: Bot):
                 except Exception:
                     pass
 
-        # Отправляем PDF
+        # PDF
         filename = f"osint_{q[:20].replace(' ', '_')}_{datetime.now().strftime('%Y%m%d')}.pdf"
         pdf_msg = await msg.answer_document(
             BufferedInputFile(pdf_bytes, filename=filename),
             caption=(
-                f"📄 *PDF-досье*\n"
-                f"🔎 Запрос: `{q}`\n"
-                f"⚠️ Действителен до: *{expires_at.strftime('%d.%m.%Y %H:%M')}*\n"
-                f"_Файл будет автоматически удалён через 24 часа_"
+                f"📄 *PDF-досье* | `{q}`\n"
+                f"⏳ Удалится: *{expires_at.strftime('%d.%m.%Y %H:%M')}*"
             ),
             parse_mode="Markdown"
         )
-
-        # Планируем удаление через 24 часа
         asyncio.create_task(_delete_pdf_later(bot, msg.chat.id, pdf_msg.message_id))
 
     except Exception as e:
@@ -1495,16 +1671,18 @@ async def h_full(msg: Message, state: FSMContext, bot: Bot):
             await w.delete()
         except Exception:
             pass
-        await msg.answer(f"⚠️ Ошибка при сборе досье: {e}")
+        await msg.answer(f"⚠️ Ошибка: {e}")
         log.exception("h_full error")
 
-    rl = get_requests_left(msg.from_user.id)
+    rl  = get_requests_left(msg.from_user.id)
     bal = "∞" if is_admin(msg.from_user.id) else str(rl)
     await msg.answer(
         f"💰 Баланс: *{bal} запросов*",
         parse_mode="Markdown",
         reply_markup=kb_main(msg.from_user.id, rl)
     )
+
+
 
 # ─── Запуск ──────────────────────────────────────────────────────────────────
 async def main():
