@@ -1327,20 +1327,82 @@ async def _check_social_profiles(nick: str) -> list[tuple[str, str, str]]:
         await asyncio.gather(*tasks)
     return found
 
+async def _check_telegram_by_phone(num_digits: str) -> dict:
+    """Проверяет наличие Telegram аккаунта по номеру через t.me."""
+    result = {"found": False, "name": None, "username": None}
+    try:
+        async with httpx.AsyncClient(timeout=8, follow_redirects=True,
+                                     headers={"User-Agent": "Mozilla/5.0"}) as client:
+            r = await client.get(f"https://t.me/+{num_digits}")
+            if r.status_code == 200:
+                text = r.text
+                name_m = re.search(r'<meta property="og:title" content="([^"]+)"', text)
+                user_m = re.search(r't\.me/([a-zA-Z0-9_]+)"', text)
+                # Если не redirect на главную страницу TG — профиль существует
+                if name_m and 'Telegram' not in name_m.group(1):
+                    result["found"] = True
+                    result["name"]  = name_m.group(1).strip()
+                    if user_m:
+                        result["username"] = user_m.group(1)
+    except Exception:
+        pass
+    return result
+
+async def _search_vk_by_phone(num_digits: str) -> list[dict]:
+    """Ищет профили ВКонтакте по номеру телефона."""
+    profiles = []
+    try:
+        async with httpx.AsyncClient(timeout=10, follow_redirects=True,
+                                     headers={"User-Agent": "Mozilla/5.0"}) as client:
+            r = await client.get(
+                f"https://vk.com/search?c[section]=people&c[phone]={num_digits}"
+            )
+            if r.status_code == 200:
+                # Ищем карточки пользователей
+                ids   = re.findall(r'id=(\d+)', r.text)
+                names = re.findall(r'<span class="labeled">([^<]+)</span>', r.text)
+                for i, uid in enumerate(ids[:3]):
+                    name = names[i] if i < len(names) else f"ID {uid}"
+                    profiles.append({
+                        "id":   uid,
+                        "name": name,
+                        "url":  f"https://vk.com/id{uid}",
+                    })
+    except Exception:
+        pass
+    return profiles
+
+async def _search_avito_by_phone(num_digits: str) -> dict:
+    """Проверяет объявления на Авито по номеру."""
+    result = {"found": False, "count": 0, "url": ""}
+    try:
+        search_url = f"https://www.avito.ru/rossiya?q={num_digits}"
+        async with httpx.AsyncClient(timeout=8, follow_redirects=True,
+                                     headers={"User-Agent": "Mozilla/5.0"}) as client:
+            r = await client.get(search_url)
+            if r.status_code == 200:
+                count_m = re.search(r'(\d+)\s+объявлени', r.text)
+                if count_m and int(count_m.group(1)) > 0:
+                    result["found"] = True
+                    result["count"] = int(count_m.group(1))
+                    result["url"]   = search_url
+    except Exception:
+        pass
+    return result
+
 async def fn_full_search(query: str) -> tuple[str, list[dict], str]:
     """
     Собирает полное досье и возвращает (card_text, pdf_sections, input_type).
-    card_text — компактная карточка в стиле скриншота.
+    card_text — компактная карточка с реальными данными.
     """
     q          = query.strip()
     input_type = detect_input_type(q)
     pdf_sections: list[dict] = []
 
-    # ── Блоки карточки ────────────────────────────────────────────────────────
-    phone_block  = ""
+    phone_block    = ""
+    live_block     = ""
     profiles_block = ""
-    tg_block     = ""
-    email_block  = ""
+    email_block    = ""
     nick_for_search = None
 
     if input_type == "phone":
@@ -1355,40 +1417,67 @@ async def fn_full_search(query: str) -> tuple[str, list[dict], str]:
             f"├ Регион: {region}\n"
             f"└ Страна: {country}\n"
         )
-        pdf_sections.append({
-            "title": "Телефонный номер",
-            "source": "Открытая база операторов РФ",
-            "lines": [f"Телефон: {clean}", f"Оператор: {op}",
-                      f"Регион: {region}", f"Страна: {country}"],
-        })
+        pdf_lines = [f"Телефон: {clean}", f"Оператор: {op}",
+                     f"Регион: {region}", f"Страна: {country}"]
 
-        # Ссылки для ручной проверки
-        tg_block = (
-            f"💬 Telegram: [открыть профиль](https://t.me/+{num_digits})\n"
-            f"🔎 GetContact: [поиск имён](https://getcontact.com/ru/{num_digits})\n"
-            f"📖 NumBuster: [телефонная книга](https://numbuster.com/number/{num_digits})\n"
-            f"👤 ВКонтакте: [поиск по номеру](https://vk.com/search?c[section]=people&c[phone]={num_digits})\n"
+        # Параллельно проверяем реальные источники
+        tg_res, vk_res, avito_res = await asyncio.gather(
+            _check_telegram_by_phone(num_digits),
+            _search_vk_by_phone(num_digits),
+            _search_avito_by_phone(num_digits),
         )
-        pdf_sections.append({
-            "title": "Ссылки для проверки",
-            "source": "Открытые сервисы",
-            "lines": [
-                f"Telegram: https://t.me/+{num_digits}",
-                f"GetContact: https://getcontact.com/ru/{num_digits}",
-                f"NumBuster: https://numbuster.com/number/{num_digits}",
-                f"VK поиск по номеру: https://vk.com/search?c[section]=people&c[phone]={num_digits}",
-            ],
-        })
+
+        live_lines = []
+        live_pdf   = []
+
+        # Telegram
+        if tg_res["found"]:
+            name = tg_res["name"] or "—"
+            user = f"@{tg_res['username']}" if tg_res["username"] else ""
+            live_lines.append(f"💬 Telegram: [{name} {user}](https://t.me/+{num_digits})")
+            live_pdf.append(f"Telegram: {name} {user} — https://t.me/+{num_digits}")
+        else:
+            live_lines.append(f"💬 Telegram: аккаунт не обнаружен / скрыт")
+            live_pdf.append("Telegram: не найден")
+
+        # ВКонтакте
+        if vk_res:
+            for p in vk_res:
+                live_lines.append(f"👤 ВКонтакте: [{p['name']}]({p['url']})")
+                live_pdf.append(f"ВКонтакте: {p['name']} — {p['url']}")
+        else:
+            live_lines.append("👤 ВКонтакте: профиль не найден (скрыт или не привязан)")
+            live_pdf.append("ВКонтакте: не найден")
+
+        # Авито
+        if avito_res["found"]:
+            live_lines.append(f"🛍 Авито: [{avito_res['count']} объявл.]({avito_res['url']})")
+            live_pdf.append(f"Авито: {avito_res['count']} объявлений — {avito_res['url']}")
+        else:
+            live_lines.append("🛍 Авито: объявлений не найдено")
+            live_pdf.append("Авито: не найдено")
+
+        # Ссылки для ручной проверки (GetContact/NumBuster — только ссылки, требуют авторизацию)
+        live_lines.append(
+            f"\n🔗 *Проверить вручную:*\n"
+            f"• [GetContact](https://getcontact.com/ru/{num_digits}) — имена из контактов\n"
+            f"• [NumBuster](https://numbuster.com/number/{num_digits}) — телефонная книга"
+        )
+
+        live_block = "\n".join(live_lines)
+
+        pdf_sections.append({"title": "Телефонный номер", "source": "База операторов РФ", "lines": pdf_lines})
+        pdf_sections.append({"title": "Проверка по источникам", "source": "Telegram / ВКонтакте / Авито", "lines": live_pdf})
 
     elif input_type == "email":
         domain = q.split('@')[1]
         known  = {
-            'gmail.com':'Google Gmail','yahoo.com':'Yahoo','mail.ru':'Mail.ru',
-            'yandex.ru':'Яндекс','yandex.com':'Яндекс','outlook.com':'Microsoft',
-            'icloud.com':'Apple iCloud','rambler.ru':'Rambler',
-            'bk.ru':'Mail.ru','list.ru':'Mail.ru','inbox.ru':'Mail.ru',
+            'gmail.com': 'Google Gmail', 'yahoo.com': 'Yahoo', 'mail.ru': 'Mail.ru',
+            'yandex.ru': 'Яндекс', 'yandex.com': 'Яндекс', 'outlook.com': 'Microsoft',
+            'icloud.com': 'Apple iCloud', 'rambler.ru': 'Rambler',
+            'bk.ru': 'Mail.ru', 'list.ru': 'Mail.ru', 'inbox.ru': 'Mail.ru',
         }
-        provider = known.get(domain, domain)
+        provider       = known.get(domain, domain)
         nick_for_search = q.split('@')[0]
 
         email_block = (
@@ -1398,10 +1487,8 @@ async def fn_full_search(query: str) -> tuple[str, list[dict], str]:
             f"└ Ник из email: `{nick_for_search}`\n"
         )
         pdf_sections.append({
-            "title": "Email",
-            "source": "Анализ домена + HaveIBeenPwned",
-            "lines": [f"Email: {q}", f"Провайдер: {provider}",
-                      f"Ник: {nick_for_search}"],
+            "title": "Email", "source": "Анализ домена",
+            "lines": [f"Email: {q}", f"Провайдер: {provider}", f"Ник: {nick_for_search}"],
         })
 
     else:
@@ -1411,7 +1498,6 @@ async def fn_full_search(query: str) -> tuple[str, list[dict], str]:
     social_profiles: list[tuple[str, str, str]] = []
     if nick_for_search:
         social_profiles = await _check_social_profiles(nick_for_search)
-
         if social_profiles:
             lines_pdf = []
             lines_tg  = []
@@ -1421,35 +1507,28 @@ async def fn_full_search(query: str) -> tuple[str, list[dict], str]:
             profiles_block = "\n".join(lines_tg) + "\n"
             pdf_sections.append({
                 "title": "Профили в интернете",
-                "source": "Прямая проверка по публичным URL",
+                "source": "Прямая проверка публичных URL",
                 "lines": lines_pdf,
             })
         else:
             profiles_block = "❌ Публичных профилей не найдено\n"
 
     # ── Сборка карточки ───────────────────────────────────────────────────────
-    type_icons = {"phone": "📱", "email": "📧", "username": "🔍"}
-    card = (
-        f"⬤ *Обнаружен идентификатор:* `{q}`\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-    )
+    card = f"⬤ *Обнаружен идентификатор:* `{q}`\n━━━━━━━━━━━━━━━━━━━━\n"
+
     if phone_block:
         card += f"\n{phone_block}"
     if email_block:
         card += f"\n{email_block}"
+    if live_block:
+        card += f"\n{live_block}\n"
     if profiles_block:
         n = len(social_profiles)
-        card += f"\n🌐 *Профили в интернете ({n} найдено):*\n{profiles_block}"
-    if tg_block:
-        card += f"\n🔗 *Полезные ссылки:*\n{tg_block}"
+        card += f"\n🌐 *Профили ({n} найдено):*\n{profiles_block}"
 
-    card += (
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🕵️ Интересовались этим: *—*\n"
-        f"📄 Генерирую PDF-отчёт... ⏳"
-    )
-
+    card += f"━━━━━━━━━━━━━━━━━━━━\n🕵️ *Генерирую PDF-отчёт...* ⏳"
     return card, pdf_sections, input_type
+
 
 
     """
