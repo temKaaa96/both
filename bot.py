@@ -8,7 +8,7 @@ import logging
 import sqlite3
 import re
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command
@@ -24,7 +24,10 @@ from aiogram.fsm.state import State, StatesGroup
 import httpx
 
 from config import BOT_TOKEN, ADMIN_ID
-from company_lookup import fetch_company, fetch_financials, fetch_location_map, build_company_report
+from company_lookup import (fetch_company, fetch_financials, fetch_location_map,
+                            build_company_spec, build_company_report)
+from report_html import generate_report_html
+from web_server import init_reports_db, save_report, report_url, start_web
 from web_lookup import fetch_ip, build_ip_report, fetch_domain, build_domain_report
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -298,7 +301,6 @@ async def h_inn(msg: Message, state: FSMContext):
     q = msg.text.strip()
     log_search(msg.from_user.id, "company", q)
     w = await msg.answer("🏢 Запрашиваю ЕГРЮЛ и ГИР БО... ⏳")
-    await ensure_fonts()
     data = await fetch_company(q)
     if not data:
         await w.delete()
@@ -306,13 +308,28 @@ async def h_inn(msg: Message, state: FSMContext):
     else:
         finance = await fetch_financials(data.get("inn") or q)
         map_img = await fetch_location_map(data)
-        pdf = build_company_report(data, finance=finance, map_img=map_img)
+        spec = build_company_spec(data, finance=finance, map_img=map_img)
+        now = datetime.now()
+        exp = now + timedelta(hours=24)
+        html = generate_report_html(
+            **spec,
+            created_str=now.strftime("%d.%m.%Y %H:%M"),
+            expires_str=exp.strftime("%d.%m.%Y %H:%M"),
+        )
+        token, _ = save_report(html)
+        url = report_url(token)
         await w.delete()
         use_request(msg.from_user.id)
-        fname = f"company_{re.sub(r'\\D', '', q)[:15]}.pdf"
-        await msg.answer_document(
-            BufferedInputFile(pdf, filename=fname),
-            caption="📄 *Проверка контрагента* | ЕГРЮЛ + ГИР БО", parse_mode="Markdown")
+        if url.startswith("http"):
+            await msg.answer(
+                f"✅ *Отчёт готов*\n\n🔗 {url}\n\n"
+                f"⏳ Ссылка действует *24 часа* — до {exp.strftime('%d.%m.%Y %H:%M')}.",
+                parse_mode="Markdown", disable_web_page_preview=True)
+        else:
+            await msg.answer(
+                "⚠️ Публичная ссылка не настроена. Задай переменную BASE_URL "
+                "или запусти как web-процесс (RAILWAY_PUBLIC_DOMAIN).",
+                reply_markup=kb_back())
     rl  = get_requests_left(msg.from_user.id)
     bal = "∞" if is_admin(msg.from_user.id) else str(rl)
     await msg.answer(f"💰 Баланс: *{bal} запросов*", parse_mode="Markdown",
@@ -419,9 +436,14 @@ async def cmd_give(msg: Message):
 # ─── Запуск ──────────────────────────────────────────────────────────────────
 async def main():
     init_db()
+    init_reports_db()
     bot = Bot(token=BOT_TOKEN)
-    log.info("Бот проверки контрагентов запущен ✅")
-    await dp.start_polling(bot)
+    runner = await start_web()          # aiohttp на 0.0.0.0:$PORT
+    log.info("Бот + веб-сервер отчётов запущены ✅")
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await runner.cleanup()
 
 if __name__ == "__main__":
     asyncio.run(main())

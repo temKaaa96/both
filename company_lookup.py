@@ -200,9 +200,10 @@ async def fetch_location_map(data: dict) -> bytes | None:
 
 
 # ─── сборка отчёта ──────────────────────────────────────────────────────
-def build_company_report(data: dict, finance: dict | None = None,
-                         logo: bytes | None = None, map_img: bytes | None = None,
-                         logo_path=None, brand=("Контр", "агент")) -> bytes:
+def build_company_spec(data: dict, finance: dict | None = None,
+                       logo: bytes | None = None, map_img: bytes | None = None,
+                       brand=("Контр", "агент")) -> dict:
+    """Готовит универсальный «spec» отчёта (для PDF и для HTML)."""
     name      = data.get("name") or {}
     name_full = name.get("full_with_opf") or name.get("short_with_opf") or "—"
     name_shrt = name.get("short_with_opf") or name_full
@@ -344,15 +345,22 @@ def build_company_report(data: dict, finance: dict | None = None,
 
     sections.append({"title": "Источники", "note": src})
 
-    return generate_report_pdf(
-        title=name_shrt,
-        subtitle=f"ИНН {inn} · {status}",
-        summary_pairs=summary,
-        sections=sections,
-        brand=brand,
-        logo_path=logo_path,
-        hero_image=logo,
-        nav=True,
-        disclaimer="Отчёт сформирован автоматически по открытым данным ЕГРЮЛ и ГИР БО. "
-                   "Не является юридически значимым документом и не заменяет выписку из ЕГРЮЛ.",
-    )
+    return {
+        "title":         name_shrt,
+        "subtitle":      f"ИНН {inn} · {status}",
+        "summary_pairs": summary,
+        "sections":      sections,
+        "brand":         brand,
+        "hero_image":    logo,
+        "nav":           True,
+        "disclaimer":    "Отчёт сформирован автоматически по открытым данным ЕГРЮЛ и ГИР БО. "
+                         "Не является юридически значимым документом и не заменяет выписку из ЕГРЮЛ.",
+    }
+
+
+def build_company_report(data: dict, finance: dict | None = None,
+                         logo: bytes | None = None, map_img: bytes | None = None,
+                         brand=("Контр", "агент")) -> bytes:
+    """PDF-версия отчёта."""
+    spec = build_company_spec(data, finance=finance, logo=logo, map_img=map_img, brand=brand)
+    return generate_report_pdf(**spec)
