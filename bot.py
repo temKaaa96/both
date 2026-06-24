@@ -27,6 +27,10 @@ import httpx
 
 from config import BOT_TOKEN, BOT_USERNAME, ADMIN_ID, DADATA_API_KEY, DADATA_SECRET_KEY
 
+# Новые модули отчётов (компании и инфраструктура)
+from company_lookup import fetch_company, build_company_report
+from web_lookup import fetch_ip, build_ip_report, fetch_domain, build_domain_report
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
@@ -1132,12 +1136,28 @@ async def cb_ip(cb: CallbackQuery, state: FSMContext):
 @dp.message(S.ip)
 async def h_ip(msg: Message, state: FSMContext):
     await state.clear()
-    use_request(msg.from_user.id)
-    log_search(msg.from_user.id, "ip", msg.text.strip())
+    q = msg.text.strip()
+    log_search(msg.from_user.id, "ip_domain", q)
     w = await msg.answer("🌐 Анализирую... ⏳")
-    result = await fn_ip(msg.text.strip())
+    await ensure_fonts()
+    if re.match(r'^\d{1,3}(\.\d{1,3}){3}$', q):
+        data = await fetch_ip(q)
+        pdf = build_ip_report(q, data) if data else None
+    else:
+        info = await fetch_domain(q)
+        pdf = build_domain_report(info) if (info.get("rdap") or info.get("ip")) else None
     await w.delete()
-    await send_result(msg, result)
+    if not pdf:
+        await msg.answer("❌ Не удалось получить данные", reply_markup=kb_back())
+    else:
+        use_request(msg.from_user.id)
+        await msg.answer_document(
+            BufferedInputFile(pdf, filename=f"{re.sub(r'[^a-zA-Z0-9.]', '_', q)[:20]}.pdf"),
+            caption="📄 *Отчёт по инфраструктуре*", parse_mode="Markdown")
+    rl  = get_requests_left(msg.from_user.id)
+    bal = "∞" if is_admin(msg.from_user.id) else str(rl)
+    await msg.answer(f"💰 Баланс: *{bal} запросов*", parse_mode="Markdown",
+                     reply_markup=kb_main(msg.from_user.id, rl))
 
 # ─── ИНН / ОГРН ──────────────────────────────────────────────────────────────
 @dp.callback_query(F.data == "s_inn")
@@ -1148,12 +1168,25 @@ async def cb_inn(cb: CallbackQuery, state: FSMContext):
 @dp.message(S.inn)
 async def h_inn(msg: Message, state: FSMContext):
     await state.clear()
-    use_request(msg.from_user.id)
-    log_search(msg.from_user.id, "inn", msg.text.strip())
-    w = await msg.answer("🏢 Запрашиваю ФНС... ⏳")
-    result = await fn_inn(msg.text.strip())
+    q = msg.text.strip()
+    log_search(msg.from_user.id, "company", q)
+    w = await msg.answer("🏢 Запрашиваю ЕГРЮЛ... ⏳")
+    await ensure_fonts()
+    data = await fetch_company(q)
     await w.delete()
-    await send_result(msg, result)
+    if not data:
+        await msg.answer("❌ Компания не найдена в реестре ЕГРЮЛ", reply_markup=kb_back())
+    else:
+        use_request(msg.from_user.id)
+        pdf = build_company_report(data)
+        fname = f"company_{re.sub(r'\\D', '', q)[:15]}.pdf"
+        await msg.answer_document(
+            BufferedInputFile(pdf, filename=fname),
+            caption="📄 *Бизнес-отчёт* | данные ЕГРЮЛ", parse_mode="Markdown")
+    rl  = get_requests_left(msg.from_user.id)
+    bal = "∞" if is_admin(msg.from_user.id) else str(rl)
+    await msg.answer(f"💰 Баланс: *{bal} запросов*", parse_mode="Markdown",
+                     reply_markup=kb_main(msg.from_user.id, rl))
 
 # ─── Reverse Image ────────────────────────────────────────────────────────────
 @dp.callback_query(F.data == "s_image")

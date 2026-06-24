@@ -112,25 +112,45 @@ def _draw_tags(pdf: FPDF, x0: float, y0: float, items: Sequence[str], max_w: flo
 
 # ─── Класс PDF с хедером/футером ───────────────────────────────────────
 class ReportPDF(FPDF):
-    def __init__(self, brand_dark="Бизнес", brand_light="отчёт", accent=ACCENT_DEF, **kw):
+    def __init__(self, brand_dark="Бизнес", brand_light="отчёт", accent=ACCENT_DEF,
+                 logo_path=None, **kw):
         super().__init__(**kw)
         self.brand_dark  = brand_dark
         self.brand_light = brand_light
         self.accent      = accent
+        self.logo_path   = logo_path if (logo_path and os.path.exists(logo_path)) else None
         self.gen_str     = datetime.now().strftime("%d.%m.%Y %H:%M")
 
     def header(self):
         self.set_fill_color(*PAGE_BG)
         self.rect(0, 0, PAGE_W, PAGE_H, style="F")        # фон страницы
-        self.set_fill_color(*self.accent)
-        self.ellipse(MARGIN, 10.3, 4.2, 4.2, style="F")   # точка-логотип
-        self.set_xy(MARGIN + 6.5, 9)
-        self.set_font("Bold", size=12)
-        self.set_text_color(*TEXT_DARK)
-        self.cell(self.get_string_width(self.brand_dark) + 1, 7, self.brand_dark)
-        self.set_font("Reg", size=12)
-        self.set_text_color(*TEXT_MID)
-        self.cell(40, 7, " " + self.brand_light)
+
+        if self.logo_path:                                # свой логотип-картинка
+            lh = 8.0
+            try:
+                from PIL import Image
+                with Image.open(self.logo_path) as im:
+                    lw = min(lh * im.width / im.height, 60)
+            except Exception:
+                lw = lh
+            self.image(self.logo_path, x=MARGIN, y=8.5, h=lh)
+            tx = MARGIN + lw + 3
+        else:                                             # дефолт: точка-кружок
+            self.set_fill_color(*self.accent)
+            self.ellipse(MARGIN, 10.3, 4.2, 4.2, style="F")
+            tx = MARGIN + 6.5
+
+        if self.brand_dark or self.brand_light:           # текст бренда (опционально)
+            self.set_xy(tx, 9)
+            self.set_font("Bold", size=12)
+            self.set_text_color(*TEXT_DARK)
+            if self.brand_dark:
+                self.cell(self.get_string_width(self.brand_dark) + 1, 7, self.brand_dark)
+            self.set_font("Reg", size=12)
+            self.set_text_color(*TEXT_MID)
+            if self.brand_light:
+                self.cell(40, 7, (" " if self.brand_dark else "") + self.brand_light)
+
         self.set_draw_color(*DIVIDER)
         self.line(MARGIN, 18, PAGE_W - MARGIN, 18)        # тонкая линия под шапкой
         self.set_y(22)                                    # курсор ниже логотипа
@@ -273,6 +293,7 @@ def generate_report_pdf(
     sections: Optional[List[Dict]] = None,
     brand: Tuple[str, str] = ("Бизнес", "отчёт"),
     accent: Tuple[int, int, int] = ACCENT_DEF,
+    logo_path: Optional[str] = None,
     disclaimer: Optional[str] = None,
 ) -> bytes:
     """
@@ -289,14 +310,16 @@ def generate_report_pdf(
           "note":  "произвольный текст",          # абзац
         }
         В одной секции можно сочетать pairs / tags / note.
-    brand           — (тёмная часть лого, серая часть лого).
-    accent          — цвет точки-логотипа.
+    brand           — (тёмная часть лого, серая часть лого). Можно ("", "") — без текста.
+    accent          — цвет точки-логотипа (если logo_path не задан).
+    logo_path       — путь к PNG/JPG логотипу; заменяет точку-кружок.
     disclaimer      — мелкий текст внизу (источник данных, оговорки).
     """
     if not (os.path.exists(FONT_PATH) and os.path.exists(FONT_BOLD_PATH)):
         raise FileNotFoundError("Нет шрифтов DejaVu — вызови ensure_fonts() перед генерацией.")
 
-    pdf = ReportPDF(brand_dark=brand[0], brand_light=brand[1], accent=accent)
+    pdf = ReportPDF(brand_dark=brand[0], brand_light=brand[1], accent=accent,
+                    logo_path=logo_path)
     pdf.add_font("Reg",  fname=FONT_PATH)
     pdf.add_font("Bold", fname=FONT_BOLD_PATH)
     pdf.set_margins(MARGIN, 22, MARGIN)
