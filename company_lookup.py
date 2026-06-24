@@ -156,8 +156,52 @@ async def fetch_financials(inn: str) -> dict | None:
         return None
 
 
+# ─── изображения из открытых источников (best-effort) ──────────────────
+async def fetch_logo(domain: str) -> bytes | None:
+    """Логотип/favicon сайта компании. Только бренд организации, не люди."""
+    if not domain:
+        return None
+    domain = re.sub(r'^https?://', '', domain.strip()).split('/')[0]
+    urls = [
+        f"https://logo.clearbit.com/{domain}",
+        f"https://www.google.com/s2/favicons?domain={domain}&sz=128",
+    ]
+    try:
+        async with httpx.AsyncClient(timeout=8, follow_redirects=True,
+                                     headers={"User-Agent": UA}) as client:
+            for u in urls:
+                r = await client.get(u)
+                ct = r.headers.get("content-type", "")
+                if r.status_code == 200 and "image" in ct and len(r.content) > 200:
+                    return r.content
+    except Exception:
+        pass
+    return None
+
+
+async def fetch_location_map(data: dict) -> bytes | None:
+    """Статичная карта по координатам адреса из ЕГРЮЛ (место, не люди)."""
+    addr = (data.get("address") or {}).get("data") or {}
+    lat, lon = addr.get("geo_lat"), addr.get("geo_lon")
+    if not (lat and lon):
+        return None
+    url = ("https://staticmap.openstreetmap.de/staticmap.php"
+           f"?center={lat},{lon}&zoom=16&size=620x300&maptype=mapnik"
+           f"&markers={lat},{lon},red-pushpin")
+    try:
+        async with httpx.AsyncClient(timeout=12, headers={"User-Agent": UA}) as client:
+            r = await client.get(url)
+            ct = r.headers.get("content-type", "")
+            if r.status_code == 200 and "image" in ct and len(r.content) > 1000:
+                return r.content
+    except Exception:
+        pass
+    return None
+
+
 # ─── сборка отчёта ──────────────────────────────────────────────────────
 def build_company_report(data: dict, finance: dict | None = None,
+                         logo: bytes | None = None, map_img: bytes | None = None,
                          logo_path=None, brand=("Контр", "агент")) -> bytes:
     name      = data.get("name") or {}
     name_full = name.get("full_with_opf") or name.get("short_with_opf") or "—"
@@ -290,8 +334,14 @@ def build_company_report(data: dict, finance: dict | None = None,
 
     # ── Источник ──
     src = ("Реквизиты — открытый реестр ЕГРЮЛ/ЕГРИП (ФНС) через официальный API DaData. "
-           "Финансовые показатели — ГИР БО (bo.nalog.gov.ru). "
-           "Сведения справочные, на дату формирования.")
+           "Финансовые показатели — ГИР БО (bo.nalog.gov.ru). Карта — OpenStreetMap по "
+           "адресу из ЕГРЮЛ. Сведения справочные, на дату формирования.")
+
+    # ── Местоположение (карта по адресу) ──
+    if map_img:
+        sections.append({"title": "Местоположение", "subtitle": "адрес из ЕГРЮЛ",
+                         "image": map_img, "caption": addr})
+
     sections.append({"title": "Источники", "note": src})
 
     return generate_report_pdf(
@@ -301,6 +351,8 @@ def build_company_report(data: dict, finance: dict | None = None,
         sections=sections,
         brand=brand,
         logo_path=logo_path,
+        hero_image=logo,
+        nav=True,
         disclaimer="Отчёт сформирован автоматически по открытым данным ЕГРЮЛ и ГИР БО. "
                    "Не является юридически значимым документом и не заменяет выписку из ЕГРЮЛ.",
     )

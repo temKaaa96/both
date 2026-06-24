@@ -88,7 +88,7 @@ def build_ip_report(ip: str, data: dict,
     return generate_report_pdf(
         title=ip, subtitle=sub or "IP-адрес",
         summary_pairs=summary, sections=sections,
-        brand=brand, logo_path=logo_path,
+        brand=brand, logo_path=logo_path, nav=True,
         disclaimer="Отчёт по открытым данным геолокации IP. Точность не гарантируется.",
     )
 
@@ -178,7 +178,7 @@ def build_domain_report(info: dict,
         title=domain,
         subtitle=(f"Регистратор: {registrar}" if registrar != "—" else "Доменное имя"),
         summary_pairs=summary, sections=sections,
-        brand=brand, logo_path=logo_path,
+        brand=brand, logo_path=logo_path, nav=True,
         disclaimer="Отчёт по открытым данным RDAP/DNS. Не является юридически значимым документом.",
     )
 

@@ -24,7 +24,7 @@ from aiogram.fsm.state import State, StatesGroup
 import httpx
 
 from config import BOT_TOKEN, ADMIN_ID
-from company_lookup import fetch_company, fetch_financials, build_company_report
+from company_lookup import fetch_company, fetch_financials, fetch_location_map, build_company_report
 from web_lookup import fetch_ip, build_ip_report, fetch_domain, build_domain_report
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -305,7 +305,8 @@ async def h_inn(msg: Message, state: FSMContext):
         await msg.answer("❌ Компания не найдена в реестре ЕГРЮЛ", reply_markup=kb_back())
     else:
         finance = await fetch_financials(data.get("inn") or q)
-        pdf = build_company_report(data, finance=finance)
+        map_img = await fetch_location_map(data)
+        pdf = build_company_report(data, finance=finance, map_img=map_img)
         await w.delete()
         use_request(msg.from_user.id)
         fname = f"company_{re.sub(r'\\D', '', q)[:15]}.pdf"
